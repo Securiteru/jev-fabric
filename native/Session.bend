@@ -41,6 +41,8 @@ def supervised(
       timeout,
       stdout,
       stderr,
+      False{},
+      "",
     )
     return mapped(raw)
 

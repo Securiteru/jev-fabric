@@ -37,7 +37,7 @@ def run_ready(argv: List<String>, input: String, ms: U32, expired: Bool) -> IO(P
       timed_out : Process.Report = Process.Report{124, True{}, False{}, False{}, False{}, "", ""}
       IO.pure(Process.Report, timed_out)
     case False{}:
-      Process.run(argv, input, ms)
+      Process.run_input(argv, input, ms)
 
 def run_for(scope: Budget, argv: List<String>, input: String, cap: U32) -> IO(Process.Report):
   do IO<Process.Report>:

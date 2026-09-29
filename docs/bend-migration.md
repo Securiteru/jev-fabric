@@ -22,8 +22,9 @@ the native executable, through the thin Python and TypeScript clients in
 
 ## Minimal practical bridge
 
-Stock Bend 2.0.27 has native files, sockets, clocks, channels and concurrent IO,
-but no child-process ownership or HTTPS stack. Pure Bend libraries supply the
+Stock Bend (now 2.0.34) has native files, sockets, clocks, channels and
+concurrent IO, and since 2.0.28 a bounded `Process.run`, but no child-process
+group ownership, detached jobs or HTTPS stack. Pure Bend libraries supply the
 JSON/UTF-8 and typed decision logic; the system libcurl supplies verified,
 pooled TLS in-process (`native/http.c` only loads and configures it), with the
 system curl executable over the **existing process bridge** as the fallback. There
@@ -65,16 +66,35 @@ access cannot be dropped merely to minimize line count.
 
 ## Toolchain findings retained from the spike
 
-Local verification uses a working Bend 2.0.27 installation, macOS arm64, Apple
-Clang 21 and Bun as a development driver. Linux native CI is configured but has
-not been executed remotely in this session. Bun drives the tests; Python 3 runs
+Local verification uses the official Bend 2.0.34 release, macOS arm64, Apple
+Clang 21 and Bun as a development driver. Bun drives the tests; Python 3 runs
 the Python client's tests.
 
-The official 2.0.27 macOS arm64 archive matches its published checksum but fails
-`codesign --verify --strict` and is killed by macOS. We do not re-sign it or bypass
-system checks. `scripts/setup-bend-ci.sh` checks the archive hash and validates
-macOS signatures; native CI currently targets Linux. A checksum match alone is
-not a working compiler test.
+The 2.0.34 macOS arm64 archive matches the sha256 in bend-lang.com's installer
+and passes `codesign --verify --strict` (Bend 2.0.28 fixed the stale signature
+that made every earlier macOS archive, 2.0.27 included, fail it). We never
+re-sign or bypass system checks. `scripts/setup-bend-ci.sh` checks the archive
+hash and validates macOS signatures; native CI still emits C on Linux, as
+releases do. A checksum match alone is not a working compiler test.
+
+Moving from 2.0.27 to 2.0.34 changed five things this project relies on:
+
+- **Verdicts.** `--check-only` prints `ALL PROOFS CHECK` (exit 0) or `SOME PROOFS
+  FAIL` (exit 1). A driver that relies on foreign code is now the second, with
+  the same list of defs. The safety gate reads the exit status and accepts that
+  verdict only for drivers, and only when it lists nothing else; pure modules
+  and proof roots still need the clean verdict.
+- **`IO.args()` starts with the program as invoked.** Every entry point drops
+  that first element before parsing, so argument handling is unchanged.
+- **Base owns `Process.run`.** Its namespace would collide with a module
+  imported `as Process`, so `native/Process.bend`'s buffered explicit-timer run
+  is now `Process.run_input` (the counterpart of `exec_input`).
+- **`Nat.read.max` left Base.** `Wire.nat_max()` states the same 2^48 - 1 cap.
+- **Effect ids are namespaced by file.** The emitted `CID_JFH_OS` became
+  `CID_HOST_JFH_OS`, so the old `#ifdef CID_JFH_OS` guards compiled but silently
+  registered nothing ("an alien request" at run time). The C effects now spell
+  every id `CID(Name)`, which the compiler resolves in the declaring file's
+  namespace, as Base's own effects do.
 
 **Whole-program ASan remains blocked**, not green. Base-only
 `native/probes/asan-dispatch.bend` reproduces a failure without project imports

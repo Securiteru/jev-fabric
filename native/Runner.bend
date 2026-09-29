@@ -56,7 +56,7 @@ def compile(+timeout: U32, source: String, args: List<String>) -> IO(Unit):
     id : String <- Host.create(1024)
     +path : String = root(configured) ++ "/" ++ id ++ "/program"
     started : Nat <- IO.now()
-    +result : Process.Report <- Process.run(["bend", source, "-o", path], "", timeout)
+    +result : Process.Report <- Process.run_input(["bend", source, "-o", path], "", timeout)
     compiled(result, path, args, started, timeout, U32.is_eq(Process.exit_code(result), 0))
 
 def allowed(timeout: U32, source: String, args: List<String>, valid: Bool) -> IO(Unit):

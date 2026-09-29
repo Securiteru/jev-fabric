@@ -13,6 +13,10 @@ def wait_default() -> U32:
 def watch_default() -> U32:
   5000
 
+# Detached `start` jobs alone may run for a day; every other limit stays one hour.
+def job_max() -> U32:
+  86400000
+
 def checked(ms: U32, valid: Bool) -> Result<&1, &1, U32 & String, U32>:
   match valid:
     case True{}:
@@ -41,8 +45,9 @@ def parse_bounded(raw: String, max: U32, bounded: Bool) -> Result<&1, &1, U32 & 
     case False{}:
       Fail{(2, "timeout must be an integer within the operation limit")}
 
+# Eight digits cover every limit (job_max included) and cannot overflow U32.
 def parse_trimmed(+raw: String, max: U32) -> Result<&1, &1, U32 & String, U32>:
-  parse_bounded(raw, max, Nat.is_le(String.length(raw), 7n))
+  parse_bounded(raw, max, Nat.is_le(String.length(raw), 8n))
 
 def parse(raw: String, max: U32) -> Result<&1, &1, U32 & String, U32>:
   parse_trimmed(trim_zeros(raw), max)

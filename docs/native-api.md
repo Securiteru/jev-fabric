@@ -1,6 +1,6 @@
 # Native API and execution contract
 
-Use stock Bend 2.0.27 native compilation. Imports below are relative to your
+Use stock Bend 2.0.34 native compilation. Imports below are relative to your
 source file; see `examples/native/`. Native code, PATH executables and imported
 modules are trusted. Affine ownership is a programming discipline, not secret
 isolation from the program that owns the client.
@@ -11,16 +11,22 @@ All commands follow `build/jev-fabric --`:
 
 | Command | Meaning |
 | --- | --- |
-| `exec [--timeout-ms N] [--stdin] [--] <command> [args...]` | Literal argv, owned process group, bounded final receipt |
+| `exec [--timeout-ms N] [--stdin] [--cwd DIR] [--] <command> [args...]` | Literal argv, owned process group, bounded final receipt |
 | `run [--timeout-ms N] [--] <program.bend> [args...]` | Compile into a private directory, then run with inherited stdin; one outside deadline covers both |
 | `validate <request.json>` | Strict UTF-8/JSON plus typed Jev request validation; no credentials/network |
 | `jev [--timeout-ms N] <request.json> [max-tokens]` | One explicit evaluation; default 100000 reported tokens |
-| `start [--timeout-ms N] [--] <command> [args...]` | Native detached worker; returns private job ID |
+| `start [--timeout-ms N] [--label TEXT] [--cwd DIR] [--input pipe] [--] <command> [args...]` | Native detached worker; returns private job ID. Lifetime 1..86400000 ms. `--input pipe` keeps stdin open for `write` |
+| `write <id> (--stdin \| -- text...)` | Queue text (standard input, or the words joined by spaces) for an interactive job's stdin; prints a write record |
+| `close-input <id>` | End an interactive job's stdin after what is queued; idempotent |
+| `read [--wait-ms N] [--base64] <id> <stdout\|stderr> [offset] [max]` | Raw bytes of one stream from a byte offset, as a read record; with `--wait-ms`, a long poll of 1..300000 ms |
 | `status <id>` | Running state or stable final receipt |
-| `events <id> [after-sequence]` | Snapshot of bounded retained JSONL events |
+| `events [--timeout-ms N] <id> [after-sequence]` | Snapshot of bounded retained JSONL events; with a timeout, a long poll of 1..300000 ms |
+| `follow [--timeout-ms N] <id> [after-sequence]` | Live JSONL events as the worker publishes them, loss records, then one `follow.end` |
+| `list` | One JSON summary of the job directories under the storage root, newest first |
 | `wait [--timeout-ms N] <id>` | Poll until final receipt or client deadline; timeout returns running state |
 | `stop <id>` | Idempotent cooperative stop through a private marker, never arbitrary PID signalling |
-| `serve [--timeout-ms N] [max-evaluations [max-tokens]]` | JSONL session on stdin/stdout: one request per line, one Jev client and deadline for the session. See [the serve protocol](serve-protocol.md) |
+| `serve [--timeout-ms N] [max-evaluations [max-tokens]]` | JSONL session on stdin/stdout: concurrent requests matched by id, one Jev client, one deadline (1..86400000 ms) and the session's children. See [the serve protocol](serve-protocol.md) |
+| `capabilities` | One JSON line: `version`, `protocol`, `store`, `platform`, `features` |
 | `update` | Print and run `curl -fsSL …/install.sh \| sh`, like `bend update`; exits with the installer's status. `JEV_FABRIC_PREFIX`/`JEV_FABRIC_VERSION` pass through |
 | `watch [--timeout-ms N] <id> <literal>` | Live bounded line batches, loss records and a final observation summary; duration 1..300000 ms |
 
@@ -30,20 +36,40 @@ Timers may be omitted. Defaults and configuration:
 | --- | --- | --- |
 | `exec`, `run`, `start`, `serve` sessions, timer-free Process/Session APIs, `Scope.open` | 1 hour | `JEV_FABRIC_TIMEOUT_MS` |
 | `jev`, `Jev.connect` | 30 seconds | `JEV_FABRIC_JEV_TIMEOUT_MS` |
-| CLI `wait` | 30 seconds | `JEV_FABRIC_WAIT_MS` |
+| CLI `wait`, `follow` | 30 seconds | `JEV_FABRIC_WAIT_MS` |
 | CLI `watch` | 5 seconds | `JEV_FABRIC_WATCH_MS` |
 
 Defaults are ceilings, not sleeps: completion returns immediately. Empty/unset
 configuration uses the default; malformed values fail closed. Explicit limits
 replace configuration for that call (even when that default is malformed).
-`wait` and `watch` only bound observation: they neither cancel nor renew a job.
+`wait`, `watch`, `follow` and `events --timeout-ms` only bound observation: they
+neither cancel nor renew a job.
 The calling harness still has its own shell-tool limits; a CLI default does not
 extend those. Use `start` and subsequent controls for work that should outlive
 a foreground tool call.
 There is no unlimited/zero timeout mode. Limits are 1..3600000 ms, except `watch`
-which permits 1..300000 ms.
+and `events --timeout-ms`, which permit 1..300000 ms, and `start` and `serve`,
+whose lifetime may be 1..86400000 ms (24 hours). The work default and
+`JEV_FABRIC_TIMEOUT_MS` stay within one hour, so a day is always explicit.
 
-Place `--timeout-ms N` and `--stdin` before the executable/source. Parsing stops
+`--cwd DIR` (`exec` and `start` only) starts the command in an existing absolute
+directory. It changes nothing else: the storage home is still resolved from the
+caller's directory or `JEV_FABRIC_HOME`, and relative command names are still
+looked up on PATH.
+
+`capabilities` prints what a host needs to choose a binary without parsing a
+version string:
+
+```json
+{"version":"0.5.0-native","protocol":2,"store":1,"platform":"darwin-arm64",
+ "features":["follow","list","label","start-24h","serve-24h","serve-concurrent","sessions","cwd",
+             "durable-input","read","jev-request-credential"]}
+```
+
+`features` lists only what this binary implements; within a protocol major,
+features are only added.
+
+Place `--timeout-ms N`, `--stdin`, `--label` and `--cwd` before the executable/source. Parsing stops
 there: all subsequent arguments are literal child arguments, including strings
 such as `--timeout-ms`. A command-local `--` ends option and legacy-number
 parsing: `exec -- 123` executes a numeric command named `123` from PATH. It is
@@ -53,7 +79,7 @@ Legacy forms remain supported: `exec/run/start/jev <ms> ...`,
 `exec <ms> --stdin ...`, `wait <id> <ms>`, `watch <id> <ms> <literal>`.
 Do not specify both a timeout flag and a positional timeout.
 
-Timeouts are 1..3600000 ms. Source compilation consumes the same `run` deadline
+`run` timeouts are 1..3600000 ms. Source compilation consumes the same `run` deadline
 as execution. `run` returns a **process receipt**: stdout may contain your
 program's JSON result. It does not
 interpret that output as a verified task outcome. Compile once yourself and use
@@ -102,22 +128,27 @@ to trusted programs. An outer timeout is not proof of cleanup of nested groups.
 - `Process.exec(argv) -> IO(Process.Report)` uses the configured work default.
 - `Process.exec_input(argv, buffered_stdin)` uses the same default with input.
 - `Process.exec_stdin(argv)` inherits fd 0 with the configured default.
-- `Process.run(argv, buffered_stdin, timeout_ms) -> IO(Process.Report)`
+- `Process.run_input(argv, buffered_stdin, timeout_ms) -> IO(Process.Report)`.
+  Before 0.4.0 this was `Process.run`; Bend 2.0.28+ Base owns that name.
 - `Process.run_stdin(argv, timeout_ms) -> IO(Process.Report)` inherits fd 0.
+- `Process.run_in(argv, buffered_stdin, timeout_ms, inherit_stdin, cwd)` is either
+  of the above, started in the absolute directory `cwd` (`""` inherits).
 - `Process.capture(argv, buffered_stdin, timeout_ms, cap) -> IO(Result<..., RawBytes>)`
   is recoverable and byte-preserving. Used for private HTTP and credentials;
   it does not emit events or public receipts.
 - `Process.run_logged(argv, timeout_ms, stdout_file, stderr_file)` consumes
   owned file descriptors and writes bounded raw spools while returning a report.
+  It accepts 1..3600000 ms; only the detached job worker uses the underlying
+  effect's 24-hour ceiling.
 - `Process.cancel(signal)` cancels the **whole owning native process scope**,
   not an independently addressable child. The cancellation flag is sticky;
   the current effect marks scope cancellation as SIGTERM regardless of that
-  argument. The supervisor then force-kills owned groups; this is not a child
-  SIGTERM/graceful-shutdown guarantee.
+  argument. Each supervisor sends SIGTERM to its owned group, then SIGKILL once
+  500 ms have passed; this is not a graceful-shutdown guarantee.
 - `Process.show(report)` serializes a receipt; `Process.exit_code(report)`
   preserves nonzero/timeout/cancel outcomes.
 
-Eight concurrent child commands per native process, 64 argv entries (including
+32 concurrent child commands per native process, 64 argv entries (including
 executable), 4096 UTF-8 bytes per entry, no embedded NUL. Normal buffered input
 is 128 KiB; inherited input streams through the OS. Private capture permits a
 larger bounded buffer for HTTP. Reports retain 32 KiB tails per stream and flag
@@ -127,8 +158,8 @@ is disclosed and draining continues so a full log does not deadlock its child.
 
 `IO.fork`/`IO.join` compose native effects. Shells, pipelines and heredocs are
 ordinary explicitly invoked executables; there is no hidden shell expansion.
-SIGINT/SIGTERM and foreign failures clean up owned groups and reap direct
-children. Intentionally escaped daemons, SIGKILL/native crashes or overridden
+SIGINT/SIGTERM stop owned groups (SIGTERM, then SIGKILL after 500 ms); deadlines
+and foreign failures kill them at once; direct children are reaped. Intentionally escaped daemons, SIGKILL/native crashes or overridden
 signal handlers are outside the guarantee. Side effects are never rolled back.
 
 ## Session.bend: interactive native handles
@@ -160,6 +191,11 @@ alive across three stateful JSONL requests, with no JS runtime.
 
 The only additional primitive is a CLOEXEC pipe returned as stock Base File
 handles (`native/pipe.c`); the existing process supervisor consumes its reader.
+`Process.Native.exec_pipe` also takes `rolling` and `cwd`: the library Session
+passes `False{}` and `""`, keeping first-byte spools; session children and
+interactive jobs use rolling spools, which keep the latest 1 MiB per stream
+behind a header (the bytes written so far and whether the stream has ended) and
+may live for a day.
 `Process.stdin()` likewise returns a CLOEXEC duplicate of fd 0 as a File, which
 reads a pipe, socket, terminal or file alike; closing it leaves fd 0 open.
 Launch validation, quota and spawn failure paths close transferred descriptors.
@@ -284,6 +320,37 @@ Writes are atomic and bounded. Workers hold a live advisory lease; no persisted
 PID is treated as authority. A dead worker can be reported failed, but execution
 is not resumed after a crash/reboot.
 
+### Storage format
+
+A storage home records its format in `.jev-fabric-store.json`, `{"store":1}`,
+private and written atomically. A home created by this release gets it at once;
+a home from an earlier release gets it from the first verb that writes to it
+(`start`, `status`, `wait`, `stop`, `run`, a session spawn), while verbs that
+only read (`list`, `events`, `follow`, `watch`, `read`) leave such a home as they
+found it. A home whose marker names a newer format, or an unreadable marker, is
+refused by every verb that touches the store with exit code 22 (for example
+`storage home uses store format 2; this jev-fabric supports store format 1`),
+and is never rewritten. Within a store version, changes are additive: readers
+ignore unknown fields. The marker is not a job: `list` never shows it and it
+does not count toward the directory cap. `StoreCore` holds the decision and its
+laws; `Host` reads and writes the file.
+
+### Job records
+
+`start` writes a private `meta.json` (`schemaVersion`, wall-clock `startedAt` in
+epoch milliseconds, optional `label`, `lifetime`) before it spawns the worker. A label is 1..120
+Unicode scalars on one line; control characters (C0, DEL, C1) and U+2028/U+2029
+are rejected with code 2. It appears as `"label"` after `"id"` in the running
+state, in every receipt (including recovered and launch-failure receipts) and in
+`list`; a job without one has no `label` member. The running state and every
+receipt then carry `"lifetime"`: `"durable"` for a job, `"session"` for a serve
+session child (whose id is `s-` followed by its directory).
+
+When the default root `.jev-fabric-native` is created, a private `.gitignore`
+containing `*` is written into it (best effort, never read back). An existing
+root, or one named by `JEV_FABRIC_HOME`, is left as it is. Hidden entries (the
+`.gitignore`, the store marker) count toward neither the directory cap nor `list`.
+
 Each job retains 64 events, at most two 1 MiB first-byte raw spools, and final
 32 KiB tails. Output previews coalesce to the latest 2048 available bytes per
 stream/tick, reporting `offset`, `bytes`, `omittedBytes`, and decoded `text`.
@@ -295,6 +362,94 @@ the final replay is written before the receipt. Cursors are monotonically
 increasing within a job; if the first returned sequence skips your cursor,
 older events were evicted. `events` is a snapshot, not a lossless subscriber.
 A recovered crash receipt does not synthesize a missing final replay event.
+
+Event lines, as `events` and `follow` print them:
+
+```json
+{"sequence":1,"type":"job.started","data":{"id":"<job>"}}
+{"sequence":2,"type":"process.output","data":{"stream":"stdout","offset":0,"bytes":6,"omittedBytes":0,"text":"ready\n"}}
+{"sequence":3,"type":"process.spool_limit","data":{"stream":"stderr","limitBytes":1048576,"mayBeTruncated":true}}
+{"sequence":4,"type":"job.finished","data":{"receiptAvailable":true}}
+```
+
+`events --timeout-ms N` is a long poll: it prints the snapshot as soon as an
+event past the cursor exists or the job has a terminal receipt, and otherwise
+prints nothing once N ms pass.
+
+`follow` polls the event file every 25 ms and prints each event past the cursor
+once, in order, as soon as the worker publishes it. If the first available
+sequence skips the cursor, `{"type":"follow.loss","after":A,"next":B}` comes
+first. It ends with exactly one line:
+
+```json
+{"type":"follow.end","reason":"finished","next":4,"receipt":{"id":"<job>",...}}
+```
+
+`reason` is `finished` only after the terminal receipt exists and the final
+replay has been printed (the receipt is read before the events, and the worker
+publishes the replay before the receipt). On `timeout`, `receipt` is the running
+state. `next` is the last sequence printed, or the input cursor. `follow` exits 0
+in both cases and fails like the other controls (code 2, 22) for an unknown or
+invalid job. It never cancels, renews or signals the job.
+
+`list` prints one object, newest `startedAt` first (jobs from before 0.4.0 have
+none and sort last):
+
+```json
+{"jobs":[{"id":"<job>","state":"running","label":"dev","startedAt":1790640000000},
+  {"id":"<job>","state":"exited","startedAt":1790630000000,"exitCode":0}],"truncated":false}
+```
+
+`state` is `running` while the worker holds its lease, `starting` before the
+worker has announced itself, and otherwise the receipt state (`exited`,
+`failed`, `timed_out`, `cancelled`); a dead worker without a receipt is
+`failed` with a null `exitCode`, as `status` reports it, but `list` does not
+write the recovery receipt. Directories that are not jobs (`run` and Session
+storage), serve session children, unsafe entries and unreadable job files are
+left out. At most 1024 jobs are reported; `truncated` discloses more.
+
+### Interactive jobs, `write`, `close-input` and `read`
+
+`start --input pipe` starts a job whose stdin stays open. Writers never touch the
+child directly: `write` appends to a private input queue in the job directory
+(`input.queue`, under an advisory lock), and the worker drains the queue into
+the child's stdin every tick (25 ms), in arrival order. The queue holds at most
+1 MiB not yet handed to the child; a write that would pass it fails (code 1,
+`job input queue is full`) and changes nothing, so a child that stops reading
+pushes back on its writers. `close-input` ends input after everything queued
+before it. A write to a job without `--input pipe` is refused (code 22), and a
+write after `close-input` or after the child has finished is an error (code 1),
+never a silent drop.
+
+```sh
+id=$(jev-fabric -- start --input pipe -- python3 -u -i | jq -r .id)
+jev-fabric -- write "$id" -- 'print(6 * 7)'        # words, joined by spaces
+printf 'print(1)\n' | jev-fabric -- write "$id" --stdin
+jev-fabric -- read --wait-ms 5000 "$id" stdout 0   # → {"offset":0,"bytes":3,"text":"42\n","next":3,...}
+jev-fabric -- close-input "$id"
+```
+
+`write` adds nothing to the text: include the newline a line-oriented child
+expects (`--stdin` passes bytes as they are). A write takes at most 65536
+characters of UTF-8 text and reports `{"id":…,"written":N,"closed":false}`, `N`
+counting bytes; `close-input` reports `"written":0,"closed":true`.
+
+An interactive job's streams keep the latest 1 MiB each (a rolling spool)
+instead of the first 1 MiB; `events`, `follow` and `watch` work as for any
+job, and loss shows as `omittedBytes`, not as `process.spool_limit`.
+
+`read` returns raw bytes of any job's stream by byte offset: the read record of
+[Shell composition](composition.md) (`offset`, `bytes`, `omittedBytes`, `text`
+or with `--base64` `data`, `next`, `eof`, `state`). Offsets count every byte the
+child wrote. A batch job's spool keeps the first 1 MiB, so a read past it returns
+nothing; an interactive job's keeps the latest 1 MiB, so a read below it starts
+at the oldest byte kept and discloses the gap. A partial UTF-8 character at the
+end is held for the next read until the stream ends. `read` never writes to the
+store.
+
+If an interactive job's worker crashes, `status` reports it failed as for any
+job. Its queued input is not replayed: nothing resumes the child, and writes
+fail with `job has finished`.
 
 Deleting old directories is an explicit user retention decision. Never delete
 an active job's directory. There is a 1024-directory cap, not automatic GC.

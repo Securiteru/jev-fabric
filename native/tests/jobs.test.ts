@@ -230,9 +230,12 @@ describe('durable native command jobs', () => {
       expect((await command(['status', id])).code).not.toBe(0);
       expect((await command(['stop', id])).code).not.toBe(0);
     }
-    for (const ms of ['0', '-1', 'oops', '3600001']) {
+    // A detached job may live a day; nothing else may exceed an hour.
+    for (const ms of ['0', '-1', 'oops', '86400001']) {
       expect((await command(['start', ms, '/bin/echo'])).code).not.toBe(0);
     }
+    expect((await command(['wait', 'a'.repeat(32), '3600001'])).code).toBe(2);
+    expect((await command(['follow', '3600001', 'a'.repeat(32)])).code).toBe(2);
     expect((await command(['start'])).code).toBe(2);
     expect((await command(['events', 'a'.repeat(32), 'oops'])).code).toBe(2);
   });
@@ -302,4 +305,21 @@ describe('durable native command jobs', () => {
     const receipt = await wait(id);
     expect(['exited', 'failed']).toContain(receipt.state);
   });
+});
+
+// Runs last: the store now holds orphans, symlinks and stray files from above.
+test('list survives every hostile entry above and reports recovered orphans', async () => {
+  const listing = await json(['list']);
+  expect(listing.truncated).toBe(false);
+  const ids = listing.jobs.map((job: any) => job.id);
+  expect(new Set(ids).size).toBe(ids.length);
+  for (const id of ids) expect(id).toMatch(/^[0-9a-f]{32}$/);
+  // The symlinked id-shaped directory is never followed.
+  expect(ids).not.toContain('c'.repeat(32));
+  // The orphan lease was recovered as failed by `status` and stays so.
+  expect(listing.jobs.find((job: any) => job.id === 'd'.repeat(32))).toMatchObject({ state: 'failed', exitCode: null });
+  const states = new Set(listing.jobs.map((job: any) => job.state));
+  for (const state of states) expect(['running', 'starting', 'exited', 'failed', 'timed_out', 'cancelled']).toContain(state);
+  // Nothing is left running by the suite except what afterAll stops.
+  expect(listing.jobs.filter((job: any) => job.state === 'running').every((job: any) => active.has(job.id))).toBe(true);
 });

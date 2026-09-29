@@ -4,7 +4,7 @@
 // each descriptor exactly once: hand an end to Native.exec_pipe or close it
 // with File.close. CLOEXEC keeps the pair out of unrelated children.
 
-#ifdef CID_NATIVE_PIPE
+#ifdef CID(Native.pipe)
 
 Term native_pipe_run(Env e, Term* f, IoWork* w) {
   int fds[2];
@@ -20,7 +20,7 @@ Term native_pipe_run(Env e, Term* f, IoWork* w) {
 }
 
 static void __attribute__((constructor)) native_pipe_use(void) {
-  io_eff(CID_NATIVE_PIPE, native_pipe_run, 0);
+  io_eff(CID(Native.pipe), native_pipe_run, 0);
 }
 
 #endif
@@ -32,7 +32,7 @@ static void __attribute__((constructor)) native_pipe_use(void) {
 // so readers duplicate the descriptor instead. File.close closes the duplicate
 // only; fd 0 stays open.
 
-#ifdef CID_NATIVE_STDIN
+#ifdef CID(Native.stdin)
 
 Term native_stdin_run(Env e, Term* f, IoWork* w) {
   int fd = fcntl(0, F_DUPFD_CLOEXEC, 3);
@@ -41,7 +41,7 @@ Term native_stdin_run(Env e, Term* f, IoWork* w) {
 }
 
 static void __attribute__((constructor)) native_stdin_use(void) {
-  io_eff(CID_NATIVE_STDIN, native_stdin_run, 0);
+  io_eff(CID(Native.stdin), native_stdin_run, 0);
 }
 
 #endif

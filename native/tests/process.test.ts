@@ -21,7 +21,7 @@ async function exec(args: string[], options: { ms?: number; input?: string } = {
 describe('native Bend/POSIX boundary', () => {
   test('help, version, rejected commands and timeout syntax', async () => {
     expect((await command(['--help'])).stdout).toContain('native Bend');
-    expect((await command(['--version'])).stdout).toContain('Bend 2.0.27');
+    expect((await command(['--version'])).stdout).toContain('Bend 2.0.34');
     expect((await command(['start'])).code).toBe(2);
     expect((await command(['exec', 'oops', '/bin/echo'])).code).toBe(2);
     expect((await command(['exec', '0', '/bin/echo'])).code).not.toBe(0);

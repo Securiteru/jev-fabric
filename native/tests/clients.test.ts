@@ -29,7 +29,8 @@ test('python client passes its offline suite', async () => {
 
 test('typescript client reports the session and returns receipts', async () => {
   const fabric = await open({ timeoutMs: 60000, maxEvaluations: 3, maxTokens: 500 });
-  expect(fabric.ready).toEqual({ protocol: 1, version: '0.3.1-native', timeoutMs: 60000, maxEvaluations: 3, maxTokens: 500 });
+  expect(fabric.ready).toMatchObject({ protocol: 2, version: '0.5.0-native', timeoutMs: 60000, maxEvaluations: 3, maxTokens: 500, store: 1 });
+  expect(await fabric.capabilities()).toMatchObject({ protocol: 2, store: 1, features: fabric.ready.features });
   expect((await fabric.exec(['/bin/echo', 'hi'])).stdout).toBe('hi\n');
   expect((await fabric.exec(['/bin/cat'], { stdin: 'piped' })).stdout).toBe('piped');
   const failed = await fabric.exec(['/bin/sh', '-c', 'exit 3']);
@@ -67,6 +68,24 @@ test('typescript client drives jobs', async () => {
   await fabric.close();
 });
 
+test('typescript client labels jobs, long-polls events and lists jobs', async () => {
+  const fabric = await open();
+  const job = await fabric.start(['/bin/sh', '-c', 'sleep 0.3; echo later'], { label: 'client job', timeoutMs: 86400000 });
+  const first = await fabric.events(job);
+  const cursor = first.at(-1)!.sequence;
+  const later = await fabric.events(job, { after: cursor, waitMs: 20000 });
+  expect(later.length).toBeGreaterThan(0);
+  expect(later.every(e => e.sequence > cursor)).toBe(true);
+  const receipt = await fabric.wait(job, { timeoutMs: 5000 });
+  expect(receipt).toMatchObject({ id: job, label: 'client job', state: 'exited' });
+  const { jobs, truncated } = await fabric.list();
+  expect(truncated).toBe(false);
+  expect(jobs.find(entry => entry.id === job)).toMatchObject({ state: 'exited', label: 'client job', exitCode: 0 });
+  const bad = await fabric.start(['/bin/echo'], { label: 'two\nlines' }).catch(error => error);
+  expect([bad.code, bad.op]).toEqual([2, 'start']);
+  await fabric.close();
+});
+
 test('typescript client surfaces startup failures and session end', async () => {
   const bad = await open({ timeoutMs: 0 }).catch(error => error);
   expect(bad).toBeInstanceOf(FabricError);
@@ -83,4 +102,31 @@ test('typescript client surfaces startup failures and session end', async () => 
   expect(ended.code).toBe(124);
   expect(ended.message).toContain('serve deadline expired');
   expect(await fabric.close()).toBe(124);
+});
+
+test('typescript client drives a session child with overlapping requests', async () => {
+  const fabric = await open();
+  const child = await fabric.spawn(['/bin/cat'], { label: 'echo' });
+  expect(child).toMatchObject({ lifetime: 'session', state: 'running', label: 'echo' });
+  const job = child.id;
+  const pending = fabric.read(job, 'stdout', { waitMs: 20000 });
+  expect(await fabric.write(job, 'ping\n')).toEqual({ id: job, written: 5, closed: false });
+  expect(await pending).toMatchObject({ id: job, offset: 0, bytes: 5, text: 'ping\n', next: 5, eof: false });
+  expect((await fabric.read(job, 'stdout', { encoding: 'base64' })).data).toBe(Buffer.from('ping\n').toString('base64'));
+  expect((await fabric.list({ scope: 'session' })).jobs.map(j => j.id)).toEqual([job]);
+  expect(await fabric.closeInput(job)).toEqual({ id: job, written: 0, closed: true });
+  expect((await fabric.wait(job, { timeoutMs: 5000 })).state).toBe('exited');
+  const late = await fabric.write(job, 'x').catch(error => error);
+  expect([late.code, late.op]).toEqual([1, 'write']);
+  expect(await fabric.close()).toBe(0);
+});
+
+test('typescript client starts and feeds a durable interactive job', async () => {
+  const fabric = await open();
+  const job = await fabric.start(['/bin/cat'], { input: 'pipe' });
+  expect(await fabric.write(job, 'queued\n')).toEqual({ id: job, written: 7, closed: false });
+  expect((await fabric.read(job, 'stdout', { waitMs: 5000 })).text).toBe('queued\n');
+  expect((await fabric.closeInput(job)).closed).toBe(true);
+  expect((await fabric.wait(job, { timeoutMs: 5000 })).state).toBe('exited');
+  await fabric.close();
 });

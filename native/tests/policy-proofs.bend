@@ -4,6 +4,10 @@ import ../MonitorCore.bend as Monitor
 import ../HttpCore.bend as Http
 import ../CredentialCore.bend as Credential
 import ../JevCore.bend as Jev
+import ../JobsCore.bend as Jobs
+import ../StoreCore.bend as Store
+import ../SpoolCore.bend as Spool
+import ../ServeCore.bend as Serve
 import ../vendor/strict-json/json.bend as J
 
 # These contracts concern the actual policy used by the effect interpreters.
@@ -165,4 +169,178 @@ law invalid_typed_reply_stays_failed:
   {Jev.response_ready(settings, budget, key, Fail{error}) == (Jev.Client{settings, budget, key}, Fail{(1, "Invalid typed Jev response")}) : Jev.Returned}
 
 def invalid_typed_reply_stays_failed(settings, budget, key, error):
+  {==}
+
+law receipt_finishes_follow:
+  for expired: Bool
+  {Jobs.follow_decision(True{}, expired) == Jobs.Finished{} : Jobs.Decision}
+
+def receipt_finishes_follow(expired):
+  {==}
+
+law expired_follow_without_receipt_times_out:
+  {Jobs.follow_decision(False{}, True{}) == Jobs.Expired{} : Jobs.Decision}
+
+def expired_follow_without_receipt_times_out():
+  {==}
+
+law followed_event_is_never_repeated:
+  for line: String
+  for cursor: U32
+  for next: U32
+  {Jobs.fresh(line, cursor, next, False{}) == Jobs.Followed{cursor, Nil{}} : Jobs.Followed}
+
+def followed_event_is_never_repeated(line, cursor, next):
+  {==}
+
+# Storage format: a home written by a newer jev-fabric is refused and never
+# adopted or rewritten, whatever the verb; the current format is used as is.
+law newer_store_is_refused:
+  for n: Nat
+  for shown: String
+  {Store.versioned(Nat.add(2n, n), shown) == Store.newer(shown) : Store.Decision}
+
+def newer_store_is_refused(n, shown):
+  {==}
+
+law current_store_is_accepted:
+  for shown: String
+  {Store.versioned(1n, shown) == Store.Accept{} : Store.Decision}
+
+def current_store_is_accepted(shown):
+  {==}
+
+law writer_adopts_unmarked_home:
+  for created: Bool
+  {Store.missing(True{}, created) == Store.Adopt{} : Store.Decision}
+
+def writer_adopts_unmarked_home(created):
+  {==}
+
+law reader_leaves_old_home_unmarked:
+  {Store.missing(False{}, False{}) == Store.Accept{} : Store.Decision}
+
+def reader_leaves_old_home_unmarked():
+  {==}
+
+# Reads by byte offset: loss below the retained window is disclosed exactly,
+# a read with nothing lost omits nothing, and an ended stream holds nothing back.
+law minus_self:
+  for n: Nat
+  {Spool.minus(n, n) == 0n : Nat}
+
+def minus_self(n):
+  match n:
+    case 0n:
+      {==}
+    case 1n+p:
+      minus_self(p)
+
+law read_from_start_discloses_loss:
+  for oldest: Nat
+  for count: Nat
+  for max: Nat
+  {Spool.span_omitted(Spool.span(oldest, count, 0n, max)) == oldest : Nat}
+
+def read_from_start_discloses_loss(oldest, count, max):
+  {==}
+
+law nothing_lost_nothing_omitted:
+  for offset: Nat
+  for count: Nat
+  for max: Nat
+  {Spool.span_omitted(Spool.span(0n, count, offset, max)) == 0n : Nat}
+
+def nothing_lost_nothing_omitted(offset, count, max):
+  match offset:
+    case 0n:
+      {==}
+    case 1n+q:
+      minus_self(1n+q)
+
+law ended_stream_holds_nothing_back:
+  for bytes: List<&2, U32>
+  {Spool.kept(bytes, True{}) == bytes : List<&2, U32>}
+
+def ended_stream_holds_nothing_back(bytes):
+  {==}
+
+law long_poll_answers_at_its_ceiling:
+  for returned: Bool
+  for eof: Bool
+  {Spool.answer_now(True{}, returned, eof) == True{} : Bool}
+
+def long_poll_answers_at_its_ceiling(returned, eof):
+  {==}
+
+# Session children: a child lives for its requested time cut to what is left of
+# its connection, and for the rest of the connection when none is requested.
+law session_child_is_cut_to_its_connection:
+  for requested: U32
+  for left: U32
+  {Serve.child_lifetime(Some{requested}, left) == U32.min(requested, left) : U32}
+
+def session_child_is_cut_to_its_connection(requested, left):
+  {==}
+
+law session_child_defaults_to_its_connection:
+  for left: U32
+  {Serve.child_lifetime(None{}, left) == U32.min(left, left) : U32}
+
+def session_child_defaults_to_its_connection(left):
+  {==}
+
+# Interactive jobs' input queue: ended input refuses every write, the bound
+# admits a queue filled exactly and refuses one byte more, and draining hands
+# the bytes over in the order they were written.
+law closed_queue_refuses_writes:
+  for total: Nat
+  for max: Nat
+  {Jobs.admit(True{}, total, max) == False{} : Bool}
+
+def closed_queue_refuses_writes(total, max):
+  {==}
+
+law queue_admits_up_to_its_bound:
+  for pending: Nat
+  for bytes: Nat
+  {Jobs.admit(False{}, Nat.add(pending, bytes), Nat.add(pending, bytes)) == True{} : Bool}
+
+def queue_admits_up_to_its_bound(pending, bytes):
+  Nat.ge_refl(Nat.add(pending, bytes))
+
+law past_bound_is_not_within:
+  for max: Nat
+  for over: Nat
+  {Nat.is_ge(max, Nat.add(max, 1n+over)) == False{} : Bool}
+
+def past_bound_is_not_within(max, over):
+  match max:
+    case 0n:
+      {==}
+    case 1n+p:
+      past_bound_is_not_within(p, over)
+
+law queue_refuses_past_its_bound:
+  for max: Nat
+  for over: Nat
+  {Jobs.admit(False{}, Nat.add(max, 1n+over), max) == False{} : Bool}
+
+def queue_refuses_past_its_bound(max, over):
+  past_bound_is_not_within(max, over)
+
+law queue_keeps_arrival_order:
+  for first: String
+  for second: String
+  {Jobs.drained(Jobs.push(Jobs.push(Jobs.empty_queue(), first), second)) == first ++ second : String}
+
+def queue_keeps_arrival_order(first, second):
+  {==}
+
+law draining_empties_the_queue:
+  for held: String
+  for closed: Bool
+  {Jobs.drained(Jobs.emptied(Jobs.Queue{held, closed})) == "" : String}
+
+def draining_empties_the_queue(held, closed):
   {==}

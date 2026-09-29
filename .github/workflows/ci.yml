@@ -2,7 +2,7 @@ name: ci
 on: [push, pull_request]
 jobs:
   native:
-    # The pinned macOS release archive has an invalid signature; see docs/bend-migration.md.
+    # Emits C on Linux; macOS compiles that same C below, as releases do.
     runs-on: ubuntu-latest
     env:
       BEND_NO_TELEMETRY: '1'

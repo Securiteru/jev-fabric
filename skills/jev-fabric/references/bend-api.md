@@ -2,7 +2,7 @@
 
 Use a Bend program when a task needs a loop: many Jev calls with one client, a
 persistent child process, or processes and decisions sharing one deadline.
-Requires the Bend 2.0.27 compiler (`bend guide` is the language reference).
+Requires the Bend 2.0.34 compiler (`bend guide` is the language reference).
 
 ## Setup
 
@@ -27,18 +27,20 @@ import ./native/Scope.bend as Scope
 Bend essentials: values are affine (use once; `+x` to reuse `Data`), a `match` only
 inspects a parameter (move computed values into a helper def), no mutual recursion,
 defs only call defs above them, and loops count down a `Nat` fuel argument.
+`IO.args()` starts with the program as invoked; drop it before parsing arguments.
 
 ## Process.bend
 
 ```python
 report : Process.Report <- Process.exec(["/bin/echo", "hi"])
 report : Process.Report <- Process.exec_input(["/bin/cat"], "buffered stdin")
-report : Process.Report <- Process.run(argv, "", 5000)        # explicit ms ceiling
+report : Process.Report <- Process.run_input(argv, "", 5000)  # explicit ms ceiling
+report : Process.Report <- Process.run_in(argv, "", 5000, False{}, "/abs/dir")  # in a cwd
 IO.print(Process.show(report))                                 # JSON receipt
 ```
 
 `Process.capture(argv, input, timeout_ms, cap)` returns raw bytes (exit code,
-flags, stdout, stderr) for binary-safe output up to ~1 MiB. At most eight
+flags, stdout, stderr) for binary-safe output up to ~1 MiB. At most 32
 concurrent children per process, 64 argv entries.
 
 ## Session.bend: a persistent child

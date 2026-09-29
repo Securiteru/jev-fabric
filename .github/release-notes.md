@@ -19,4 +19,4 @@ Each archive holds the `jev-fabric` executable, the Bend library (`native/`) for
 `jev-fabric -- run` programs, single-file Python and TypeScript clients
 (`clients/`) for `jev-fabric -- serve` sessions, the examples and the agent skill. Verify with
 `SHA256SUMS`; the installer does this for you. Jev calls need the system libcurl or
-`curl` and a CA store; compiling your own Bend programs needs Bend 2.0.27.
+`curl` and a CA store; compiling your own Bend programs needs Bend 2.0.34.

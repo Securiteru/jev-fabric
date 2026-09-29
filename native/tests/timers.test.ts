@@ -85,7 +85,7 @@ test('public defaults and checked pure deadline/CLI policy are registered', asyn
   for (const text of documented) expect(help.out).toContain(text);
   const p = await run([], { program: resolve('build/test-time-core') });
   expect(p.code, p.err).toBe(0);
-  expect(p.out).toContain('native timer policy assertions: 24');
+  expect(p.out).toContain('native timer policy assertions: 59');
 });
 
 test('timer-free literal exec, inherited stdin and legacy syntax return immediately', async () => {

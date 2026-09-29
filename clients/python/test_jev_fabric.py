@@ -38,7 +38,10 @@ class FabricTest(unittest.TestCase):
 
     def test_ready_reports_session_budgets(self):
         with self.open(timeout_ms=60000, max_evaluations=4, max_tokens=900) as fabric:
-            self.assertEqual(fabric.ready["protocol"], 1)
+            self.assertEqual(fabric.ready["protocol"], 2)
+            self.assertEqual(fabric.ready["store"], 1)
+            self.assertIn("sessions", fabric.ready["features"])
+            self.assertEqual(fabric.capabilities()["features"], fabric.ready["features"])
             self.assertEqual(fabric.ready["timeoutMs"], 60000)
             self.assertEqual(fabric.ready["maxEvaluations"], 4)
             self.assertEqual(fabric.ready["maxTokens"], 900)
@@ -69,6 +72,23 @@ class FabricTest(unittest.TestCase):
             self.assertTrue(all("sequence" in e for e in fabric.events(job)))
             self.assertEqual(fabric.stop(job)["state"], "exited")
 
+    def test_labels_long_poll_and_list(self):
+        with self.open() as fabric:
+            job = fabric.start(["/bin/sh", "-c", "sleep 0.3; echo later"], label="py job", timeout_ms=86400000)
+            cursor = fabric.events(job)[-1]["sequence"]
+            later = fabric.events(job, after=cursor, wait_ms=20000)
+            self.assertTrue(later)
+            self.assertTrue(all(e["sequence"] > cursor for e in later))
+            receipt = fabric.wait(job, timeout_ms=5000)
+            self.assertEqual((receipt["label"], receipt["state"]), ("py job", "exited"))
+            listing = fabric.list()
+            self.assertFalse(listing["truncated"])
+            entry = next(j for j in listing["jobs"] if j["id"] == job)
+            self.assertEqual((entry["state"], entry["label"], entry["exitCode"]), ("exited", "py job", 0))
+            with self.assertRaises(FabricError) as caught:
+                fabric.start(["/bin/echo"], label="x" * 121)
+            self.assertEqual(caught.exception.code, 2)
+
     def test_validate_and_jev_budget(self):
         with self.open(max_evaluations=0) as fabric:
             self.assertEqual(fabric.validate(REQUEST), REQUEST)
@@ -90,6 +110,42 @@ class FabricTest(unittest.TestCase):
             for t in threads:
                 t.join()
         self.assertEqual(sorted(results), ["0\n", "1\n", "2\n", "3\n"])
+
+    def test_session_children(self):
+        with self.open() as fabric:
+            child = fabric.spawn(["/bin/cat"], label="echo")
+            job = child["id"]
+            self.assertTrue(job.startswith("s-"))
+            self.assertEqual((child["lifetime"], child["state"]), ("session", "running"))
+            # A long poll waits in its own thread while this one writes.
+            box = {}
+            reader = threading.Thread(target=lambda: box.update(read=fabric.read(job, "stdout", wait_ms=20000)))
+            reader.start()
+            time.sleep(0.2)
+            self.assertEqual(fabric.write(job, "héllo\n"), {"id": job, "written": 7, "closed": False})
+            reader.join()
+            self.assertEqual(box["read"]["text"], "héllo\n")
+            self.assertEqual(box["read"]["next"], 7)
+            raw = fabric.read(job, "stdout", encoding="base64")
+            self.assertEqual(raw["data"], "aMOpbGxvCg==")
+            self.assertEqual(fabric.list(scope="session")["jobs"][0]["id"], job)
+            self.assertTrue(fabric.close_input(job)["closed"])
+            self.assertEqual(fabric.wait(job, timeout_ms=5000)["state"], "exited")
+            with self.assertRaises(FabricError) as caught:
+                fabric.write(job, "late")
+            self.assertEqual(caught.exception.code, 1)
+            sleeper = fabric.spawn(["/bin/sleep", "30"])["id"]
+        # Ending the session stopped the child it spawned.
+        self.assertEqual(fabric.close(), 0)
+        self.assertTrue(sleeper.startswith("s-"))
+
+    def test_durable_interactive_job(self):
+        with self.open() as fabric:
+            job = fabric.start(["/bin/cat"], input="pipe")
+            self.assertEqual(fabric.write(job, "queued\n"), {"id": job, "written": 7, "closed": False})
+            self.assertEqual(fabric.read(job, "stdout", wait_ms=5000)["text"], "queued\n")
+            self.assertTrue(fabric.close_input(job)["closed"])
+            self.assertEqual(fabric.wait(job, timeout_ms=5000)["state"], "exited")
 
     def test_startup_failure_raises(self):
         with self.assertRaises(FabricError) as caught:

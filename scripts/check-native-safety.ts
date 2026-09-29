@@ -13,13 +13,16 @@ export interface Manifest {
 }
 interface Token { value: string; literal: boolean; line: number }
 
-const REVIEWED_COMPILER = 'bend 2.0.27';
+const REVIEWED_COMPILER = 'bend 2.0.34';
 const WORD_CHAR = /[A-Za-z0-9_./-]/;
 const FOREIGN_IMPORT = /^"[A-Za-z0-9_./-]+\.c"$/;
 const EFFECT_CAPABILITY = /(^|[.])(IO|File|Socket|Listener|Window|Audio|Chan)([.]|$)/;
-// The only non-clean verdict accepted, and only for driver modules.
+// Bend 2.0.32+ prints one verdict. A clean check exits 0 with exactly this text.
+const CLEAN_VERDICT = 'ALL PROOFS CHECK\nUse --verdict for mathematical validity.';
+// The only non-clean verdict accepted, and only for driver modules: it exits 1
+// and lists nothing but the defs that rely on (allowlisted) foreign code.
 const DRIVER_VERDICT =
-  /^All terms check, but [0-9]+ defs? rel(?:y|ies) on unsafe or foreign code:\n(?:- [A-Za-z0-9_./-]+\n?)+$/;
+  /^SOME PROOFS FAIL\nError: [0-9]+ defs? rel(?:y|ies) on unsafe or foreign code:\n(?:- [A-Za-z0-9_./-]+\n?)+$/;
 
 // Strip line comments, preserve literals for imports, and do not interpret
 // quoted/commented '?' or '@unsafe' text as code. This is not a typechecker.
@@ -174,11 +177,11 @@ export function auditSources(sources: Map<string, string>, manifest: Manifest) {
   return { pure: seen, files: sources.size, foreign: effects.size };
 }
 
-export function acceptVerdict(file: string, output: string, pure: boolean) {
-  const clean = output.trim();
-  if (clean === 'All terms check.') return;
-  if (!pure && DRIVER_VERDICT.test(clean)) return;
-  throw new Error(`${file}: unacceptable compiler trust verdict\n${clean}`);
+export function acceptVerdict(file: string, output: string, pure: boolean, exitCode = 0) {
+  const verdict = output.trim();
+  if (exitCode === 0 && verdict === CLEAN_VERDICT) return;
+  if (!pure && exitCode === 1 && DRIVER_VERDICT.test(verdict)) return;
+  throw new Error(`${file}: unacceptable compiler trust verdict (exit ${exitCode})\n${verdict}`);
 }
 
 export function collect(root: string): Map<string, string> {
@@ -197,7 +200,7 @@ export function collect(root: string): Map<string, string> {
   return result;
 }
 
-interface CompilerRun { output: string; failure?: string }
+interface CompilerRun { output: string; exitCode: number; failure?: string }
 
 // Deadline for one compiler run that has the machine to itself.
 const COMPILER_TIMEOUT_MS = 30000;
@@ -221,14 +224,19 @@ function compile(
   return new Promise(done => {
     execFile('bend', args, options, (error, stdout, stderr) => {
       if (!error) {
-        done({ output: stdout + stderr });
+        done({ output: stdout + stderr, exitCode: 0 });
         return;
       }
-      // A compiler that exited or died on its own reports its text; harness errors
-      // (spawn failure, timeout, output limit, abort) report themselves.
-      const ended = typeof error.code === 'number' || (error.signal && !error.killed);
+      // A compiler that exited with a status reports its verdict, which acceptVerdict
+      // judges; one killed by a signal, and harness errors (spawn failure, timeout,
+      // output limit, abort), are failures.
+      if (typeof error.code === 'number') {
+        done({ output: stdout + stderr, exitCode: error.code });
+        return;
+      }
+      const ended = error.signal && !error.killed;
       const detail = ended ? stderr + stdout : String(error);
-      done({ output: '', failure: `bend ${args.join(' ')}: ${detail}` });
+      done({ output: '', exitCode: -1, failure: `bend ${args.join(' ')}: ${detail}` });
     });
   });
 }
@@ -268,6 +276,7 @@ export async function check(root: string) {
   const audit = auditSources(sources, manifest);
   const version = await compile(root, ['version']);
   if (version.failure) throw new Error(version.failure);
+  if (version.exitCode !== 0) throw new Error(`bend version exited ${version.exitCode}`);
   if (version.output.trim() !== manifest.compiler) {
     throw new Error('unreviewed compiler version');
   }
@@ -282,7 +291,7 @@ export async function check(root: string) {
   const checks = [...sources.keys()].map(path => ({
     path,
     run: slot(() => {
-      if (cancel.signal.aborted) return Promise.resolve({ output: '', failure: 'cancelled' });
+      if (cancel.signal.aborted) return Promise.resolve({ output: '', exitCode: -1, failure: 'cancelled' });
       return compile(root, [path, '--check-only'], timeout, cancel.signal);
     }),
   }));
@@ -291,7 +300,7 @@ export async function check(root: string) {
       console.error(`Checking Bend: ${path}`);
       const verdict = await run;
       if (verdict.failure) throw new Error(verdict.failure);
-      acceptVerdict(path, verdict.output, audit.pure.has(path));
+      acceptVerdict(path, verdict.output, audit.pure.has(path), verdict.exitCode);
     }
   } finally {
     cancel.abort();

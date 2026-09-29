@@ -42,3 +42,16 @@ law duplicate_timeout_is_rejected:
 
 def duplicate_timeout_is_rejected(first, second):
   {==}
+
+law rejected_label_is_never_stored:
+  for text: String
+  {Cli.label_allowed(text, False{}) == Fail{(2, "label must be 1..120 printable characters on one line")} : Result<&1, &1, U32 & String, String>}
+
+def rejected_label_is_never_stored(text):
+  {==}
+
+law serve_connection_may_last_a_day:
+  {Cli.max("serve") == 86400000 : U32}
+
+def serve_connection_may_last_a_day():
+  {==}

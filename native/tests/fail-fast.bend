@@ -10,9 +10,9 @@ def await_marker(marker: String) -> List<String>:
 
 def fail_fast(+marker: String) -> IO(Unit):
   do IO<Unit>:
-    child : Chan(Process.Report) <- IO.fork(Process.Report, Process.run(sleeper(marker), "", 60000))
-    ready : Process.Report <- Process.run(await_marker(marker), "", 1500)
-    failure : Process.Report <- Process.run(["/jev-fabric-native-intentionally-missing"], "", 1000)
+    child : Chan(Process.Report) <- IO.fork(Process.Report, Process.run_input(sleeper(marker), "", 60000))
+    ready : Process.Report <- Process.run_input(await_marker(marker), "", 1500)
+    failure : Process.Report <- Process.run_input(["/jev-fabric-native-intentionally-missing"], "", 1000)
     IO.die(Unit, 1, "unreachable: missing command should fail")
 
 def args(values: List<String>) -> IO(Unit):
@@ -24,5 +24,7 @@ def args(values: List<String>) -> IO(Unit):
 
 def main() -> IO(Unit):
   do IO<Unit>:
-    values : List<String> <- IO.args()
+    # IO.args() starts with the program as invoked (Bend 2.0.32+).
+    invoked : List<String> <- IO.args()
+    values : List<String> = List.drop(&1, String, invoked, 1n)
     args(values)

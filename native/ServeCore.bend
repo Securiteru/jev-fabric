@@ -4,15 +4,58 @@ import ./Json.bend as Json
 import ./Wire.bend as Wire
 import ./Streams.bend as Streams
 import ./TimeCore.bend as Time
+import ./Cli.bend as Cli
+import ./StoreCore.bend as Store
+import ./JobsCore.bend as Jobs
 import ./vendor/strict-json/json.bend as J
 
 # Pure policy for `serve`: one JSON request per input line, one JSON response per
 # output line. Serve.bend performs the reads, prints and subprocess calls.
+# Protocol 2 answers requests concurrently: responses may come out of order and
+# are matched by id.
 def Error() -> Type:
   U32 & String
 
 def protocol() -> U32:
-  1
+  2
+
+# Only features this binary implements. Within a protocol major, features are
+# only ever added.
+def features() -> List<&2, String>:
+  [
+    "follow",
+    "list",
+    "label",
+    "start-24h",
+    "serve-24h",
+    "serve-concurrent",
+    "sessions",
+    "cwd",
+    "durable-input",
+    "read",
+    "jev-request-credential",
+  ]
+
+def strings_json(items: List<&2, String>, first: Bool) -> String:
+  match items:
+    case Nil{}:
+      ""
+    case Con{item, rest}:
+      Bool.pick(String, first, "", ",") ++ Json.quote(item) ++ strings_json(rest, False{})
+
+def features_json() -> String:
+  "[" ++ strings_json(features(), True{}) ++ "]"
+
+# What a host needs to choose a binary without guessing from its version.
+def capability_fields(version: String, platform: String) -> String:
+  "\"version\":" ++ Json.quote(version)
+    ++ ",\"protocol\":" ++ U32.show(protocol())
+    ++ ",\"store\":" ++ Nat.show(Store.version())
+    ++ ",\"platform\":" ++ Json.quote(platform)
+    ++ ",\"features\":" ++ features_json()
+
+def capabilities(version: String, platform: String) -> String:
+  "{" ++ capability_fields(version, platform) ++ "}"
 
 # A request line has the strict JSON bound; a longer partial line ends the session.
 def line_max() -> U32:
@@ -103,27 +146,36 @@ def budget(args: List<String>) -> Result<&1, &1, Error, U32 & U32>:
     case other:
       Fail{(2, "usage: serve [--timeout-ms N] [max-evaluations [max-tokens]]")}
 
-def banner(version: String, +timeout: U32, +calls: U32, +tokens: U32) -> String:
+def banner(version: String, platform: String, +timeout: U32, +calls: U32, +tokens: U32) -> String:
   "{\"ready\":{\"protocol\":" ++ U32.show(protocol())
     ++ ",\"version\":" ++ Json.quote(version)
     ++ ",\"timeoutMs\":" ++ U32.show(timeout)
     ++ ",\"maxEvaluations\":" ++ U32.show(calls)
     ++ ",\"maxTokens\":" ++ U32.show(tokens)
+    ++ ",\"store\":" ++ Nat.show(Store.version())
+    ++ ",\"platform\":" ++ Json.quote(platform)
+    ++ ",\"features\":" ++ features_json()
     ++ "}}"
 
 # ---------------------------------------------------------------------------
 # Requests.
 
 type Op is Data:
-  Exec{argv: List<&2, String>, input: String, timeout: Maybe<&2, U32>}
-  Start{argv: List<&2, String>, timeout: Maybe<&2, U32>}
+  Exec{argv: List<&2, String>, input: String, timeout: Maybe<&2, U32>, cwd: String}
+  Start{argv: List<&2, String>, timeout: Maybe<&2, U32>, label: String, cwd: String, pipe: Bool}
+  Spawn{argv: List<&2, String>, pipe: Bool, timeout: Maybe<&2, U32>, label: String, cwd: String}
   Status{job: String}
-  Events{job: String, after: U32}
+  Events{job: String, after: U32, wait: Maybe<&2, U32>}
   Wait{job: String, timeout: Maybe<&2, U32>}
   Stop{job: String}
   Watch{job: String, literal: String, timeout: Maybe<&2, U32>}
+  Write{job: String, text: String}
+  CloseInput{job: String}
+  ReadOut{job: String, stream: String, offset: Nat, max: Nat, wait: Maybe<&2, U32>, base64: Bool}
+  ListJobs{sessions: Bool}
+  Capabilities{}
   Validate{request: J.JSON}
-  Evaluate{request: J.JSON, timeout: Maybe<&2, U32>}
+  Evaluate{request: J.JSON, timeout: Maybe<&2, U32>, provider: String, credential: String}
 
 def fail(message: String) -> Error:
   (2, message)
@@ -231,6 +283,89 @@ def timeout_found(value: Maybe<&2, J.JSON>, max: U32) -> Result<&1, &1, Error, M
 def timeout(fields: List<&2, J.JSON>, max: U32) -> Result<&1, &1, Error, Maybe<&2, U32>>:
   timeout_found(Codec.find_field(fields, "timeoutMs"), max)
 
+# `events.waitMs`: an optional long poll, 1..300000 ms, like `watch`.
+def wait_error() -> Error:
+  fail("waitMs must be an integer from 1 to 300000")
+
+def wait_parsed(parsed: Result<&1, &1, Error, U32>) -> Result<&1, &1, Error, Maybe<&2, U32>>:
+  match parsed:
+    case Fail{e}:
+      Fail{wait_error()}
+    case Done{ms}:
+      Done{Some{ms}}
+
+def wait_value(value: J.JSON) -> Result<&1, &1, Error, Maybe<&2, U32>>:
+  match value:
+    case J.Num{lex}:
+      wait_parsed(Time.parse(lex, 300000))
+    case other:
+      Fail{wait_error()}
+
+def wait_found(value: Maybe<&2, J.JSON>) -> Result<&1, &1, Error, Maybe<&2, U32>>:
+  match value:
+    case None{}:
+      Done{None{}}
+    case Some{v}:
+      wait_value(v)
+
+def wait_ms(fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Maybe<&2, U32>>:
+  wait_found(Codec.find_field(fields, "waitMs"))
+
+# `start.label`: checked exactly as the CLI's --label; absent means none.
+def label_value(value: J.JSON) -> Result<&1, &1, Error, String>:
+  match value:
+    case J.Str{s}:
+      Cli.label_checked(s)
+    case other:
+      Fail{fail("label must be a string")}
+
+def label_found(value: Maybe<&2, J.JSON>) -> Result<&1, &1, Error, String>:
+  match value:
+    case None{}:
+      Done{""}
+    case Some{v}:
+      label_value(v)
+
+# `cwd`: an absolute directory for the child, checked as the CLI's --cwd.
+def cwd_value(value: J.JSON) -> Result<&1, &1, Error, String>:
+  match value:
+    case J.Str{s}:
+      Cli.cwd_checked(s)
+    case other:
+      Fail{fail("cwd must be a string")}
+
+def cwd_found(value: Maybe<&2, J.JSON>) -> Result<&1, &1, Error, String>:
+  match value:
+    case None{}:
+      Done{""}
+    case Some{v}:
+      cwd_value(v)
+
+def cwd(fields: List<&2, J.JSON>) -> Result<&1, &1, Error, String>:
+  cwd_found(Codec.find_field(fields, "cwd"))
+
+# One of `choices`, or absent (the first choice).
+def choice_if(value: String, ok: Bool, message: String) -> Result<&1, &1, Error, String>:
+  match ok:
+    case True{}:
+      Done{value}
+    case False{}:
+      Fail{fail(message)}
+
+def choice_value(value: J.JSON, +choices: List<&2, String>, +message: String) -> Result<&1, &1, Error, String>:
+  match value:
+    case J.Str{+s}:
+      choice_if(s, Codec.contains(choices, s), message)
+    case other:
+      Fail{fail(message)}
+
+def choice(found: Maybe<&2, J.JSON>, +fallback: String, choices: List<&2, String>, message: String) -> Result<&1, &1, Error, String>:
+  match found:
+    case None{}:
+      Done{fallback}
+    case Some{v}:
+      choice_value(v, choices, message)
+
 def cursor_error() -> Error:
   fail("after must be an event sequence number")
 
@@ -264,6 +399,82 @@ def cursor_found(value: Maybe<&2, J.JSON>) -> Result<&1, &1, Error, U32>:
 
 def cursor(fields: List<&2, J.JSON>) -> Result<&1, &1, Error, U32>:
   cursor_found(Codec.find_field(fields, "after"))
+
+# A byte offset: a non-negative integer up to 2^48 - 1.
+def offset_error() -> Error:
+  fail("offset must be a byte offset (a non-negative integer)")
+
+def offset_read(value: Maybe<&2, Nat>) -> Result<&1, &1, Error, Nat>:
+  match value:
+    case Some{n}:
+      Done{n}
+    case None{}:
+      Fail{offset_error()}
+
+def offset_value(value: J.JSON) -> Result<&1, &1, Error, Nat>:
+  match value:
+    case J.Num{lex}:
+      offset_read(Nat.read(lex))
+    case other:
+      Fail{offset_error()}
+
+def offset_found(value: Maybe<&2, J.JSON>) -> Result<&1, &1, Error, Nat>:
+  match value:
+    case None{}:
+      Done{0n}
+    case Some{v}:
+      offset_value(v)
+
+def max_parsed(parsed: Result<&1, &1, Error, U32>) -> Result<&1, &1, Error, Nat>:
+  match parsed:
+    case Fail{e}:
+      Fail{fail("max must be an integer from 1 to 65536")}
+    case Done{n}:
+      Done{U32.to_nat(n)}
+
+def max_value(value: J.JSON) -> Result<&1, &1, Error, Nat>:
+  match value:
+    case J.Num{lex}:
+      max_parsed(Time.parse(lex, 65536))
+    case other:
+      Fail{fail("max must be an integer from 1 to 65536")}
+
+def max_found(value: Maybe<&2, J.JSON>) -> Result<&1, &1, Error, Nat>:
+  match value:
+    case None{}:
+      Done{65536n}
+    case Some{v}:
+      max_value(v)
+
+# `write.text`: at most 65536 Unicode characters, like Session.write.
+def text_bounded(text: String, ok: Bool) -> Result<&1, &1, Error, String>:
+  match ok:
+    case True{}:
+      Done{text}
+    case False{}:
+      Fail{fail("text must be at most 65536 characters")}
+
+def write_text(fields: List<&2, J.JSON>) -> Result<&1, &1, Error, String>:
+  do Result<&1, &1, Error, String>:
+    +raw : String <- text(fields, "text")
+    text_bounded(raw, Nat.is_le(String.length(raw), 65536n))
+
+# A per-request Jev credential: a non-empty string, never echoed back.
+def credential_value(value: J.JSON) -> Result<&1, &1, Error, String>:
+  match value:
+    case J.Str{SNil{}}:
+      Fail{fail("credential must be a non-empty string")}
+    case J.Str{s}:
+      Done{s}
+    case other:
+      Fail{fail("credential must be a non-empty string")}
+
+def credential_found(value: Maybe<&2, J.JSON>) -> Result<&1, &1, Error, String>:
+  match value:
+    case None{}:
+      Done{""}
+    case Some{v}:
+      credential_value(v)
 
 def strings(items: List<&2, J.JSON>) -> Result<&1, &1, Error, List<&2, String>>:
   match items:
@@ -332,18 +543,59 @@ def allowed(fields: List<&2, J.JSON>, +keys: List<&2, String>) -> Result<&1, &1,
 
 def exec_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
   do Result<&1, &1, Error, Op>:
-    allowed(fields, ["argv", "stdin", "timeoutMs"])
+    allowed(fields, ["argv", "stdin", "timeoutMs", "cwd"])
     command : List<&2, String> <- argv(fields)
     input : String <- optional_text(Codec.find_field(fields, "stdin"), "stdin")
     ms : Maybe<&2, U32> <- timeout(fields, 3600000)
-    return Exec{command, input, ms}
+    dir : String <- cwd(fields)
+    return Exec{command, input, ms, dir}
 
+# A job's own lifetime may reach a day; it is not bounded by the session.
 def start_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
   do Result<&1, &1, Error, Op>:
-    allowed(fields, ["argv", "timeoutMs"])
+    allowed(fields, ["argv", "timeoutMs", "label", "cwd", "input"])
     command : List<&2, String> <- argv(fields)
-    ms : Maybe<&2, U32> <- timeout(fields, 3600000)
-    return Start{command, ms}
+    ms : Maybe<&2, U32> <- timeout(fields, Time.job_max())
+    label : String <- label_found(Codec.find_field(fields, "label"))
+    dir : String <- cwd(fields)
+    +input : String <- choice(Codec.find_field(fields, "input"), "null", ["pipe", "null"], "input must be \"pipe\" or \"null\"")
+    return Start{command, ms, label, dir, String.eq(input, "pipe")}
+
+# A session child lives at most a day, and never longer than its connection.
+def spawn_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
+  do Result<&1, &1, Error, Op>:
+    allowed(fields, ["argv", "stdin", "timeoutMs", "label", "cwd"])
+    command : List<&2, String> <- argv(fields)
+    +input : String <- choice(Codec.find_field(fields, "stdin"), "pipe", ["pipe", "null"], "stdin must be \"pipe\" or \"null\"")
+    ms : Maybe<&2, U32> <- timeout(fields, Time.job_max())
+    label : String <- label_found(Codec.find_field(fields, "label"))
+    dir : String <- cwd(fields)
+    return Spawn{command, String.eq(input, "pipe"), ms, label, dir}
+
+def write_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
+  do Result<&1, &1, Error, Op>:
+    allowed(fields, ["job", "text"])
+    id : String <- job(fields)
+    written : String <- write_text(fields)
+    return Write{id, written}
+
+def close_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
+  do Result<&1, &1, Error, Op>:
+    allowed(fields, ["job"])
+    id : String <- job(fields)
+    return CloseInput{id}
+
+def read_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
+  do Result<&1, &1, Error, Op>:
+    allowed(fields, ["job", "stream", "offset", "max", "waitMs", "encoding"])
+    id : String <- job(fields)
+    +stream : String <- choice(Codec.find_field(fields, "stream"), "", ["stdout", "stderr"], "stream must be \"stdout\" or \"stderr\"")
+    +named : String <- choice_if(stream, Bool.not(String.is_empty(stream)), "missing field: stream")
+    at : Nat <- offset_found(Codec.find_field(fields, "offset"))
+    most : Nat <- max_found(Codec.find_field(fields, "max"))
+    wait : Maybe<&2, U32> <- wait_ms(fields)
+    +encoding : String <- choice(Codec.find_field(fields, "encoding"), "text", ["text", "base64"], "encoding must be \"text\" or \"base64\"")
+    return ReadOut{id, named, at, most, wait, String.eq(encoding, "base64")}
 
 def status_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
   do Result<&1, &1, Error, Op>:
@@ -353,10 +605,11 @@ def status_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
 
 def events_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
   do Result<&1, &1, Error, Op>:
-    allowed(fields, ["job", "after"])
+    allowed(fields, ["job", "after", "waitMs"])
     id : String <- job(fields)
     after : U32 <- cursor(fields)
-    return Events{id, after}
+    wait : Maybe<&2, U32> <- wait_ms(fields)
+    return Events{id, after, wait}
 
 def wait_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
   do Result<&1, &1, Error, Op>:
@@ -379,18 +632,35 @@ def watch_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
     ms : Maybe<&2, U32> <- timeout(fields, 300000)
     return Watch{id, literal, ms}
 
+# `scope`: "store" (the default) lists the storage root's jobs, as the CLI does;
+# "session" lists this connection's session children.
+def list_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
+  do Result<&1, &1, Error, Op>:
+    allowed(fields, ["scope"])
+    +scope : String <- choice(Codec.find_field(fields, "scope"), "store", ["store", "session"], "scope must be \"store\" or \"session\"")
+    return ListJobs{String.eq(scope, "session")}
+
+def capabilities_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
+  do Result<&1, &1, Error, Op>:
+    allowed(fields, [])
+    return Capabilities{}
+
 def validate_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
   do Result<&1, &1, Error, Op>:
     allowed(fields, ["request"])
     request : J.JSON <- need(fields, "request")
     return Validate{request}
 
+# `provider` and `credential` apply to this request only: the credential is
+# never cached in the session's client, echoed, or written anywhere.
 def jev_op(+fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
   do Result<&1, &1, Error, Op>:
-    allowed(fields, ["request", "timeoutMs"])
+    allowed(fields, ["request", "timeoutMs", "provider", "credential"])
     request : J.JSON <- need(fields, "request")
     ms : Maybe<&2, U32> <- timeout(fields, 3600000)
-    return Evaluate{request, ms}
+    provider : String <- choice(Codec.find_field(fields, "provider"), "", ["typesafe", "openrouter", "vercel"], "provider must be typesafe, openrouter or vercel")
+    credential : String <- credential_found(Codec.find_field(fields, "credential"))
+    return Evaluate{request, ms, provider, credential}
 
 def op(name: String, fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
   match name:
@@ -398,6 +668,16 @@ def op(name: String, fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
       exec_op(fields)
     case "start":
       start_op(fields)
+    case "spawn":
+      spawn_op(fields)
+    case "write":
+      write_op(fields)
+    case "closeInput":
+      close_op(fields)
+    case "read":
+      read_op(fields)
+    case "capabilities":
+      capabilities_op(fields)
     case "status":
       status_op(fields)
     case "events":
@@ -408,12 +688,14 @@ def op(name: String, fields: List<&2, J.JSON>) -> Result<&1, &1, Error, Op>:
       stop_op(fields)
     case "watch":
       watch_op(fields)
+    case "list":
+      list_op(fields)
     case "validate":
       validate_op(fields)
     case "jev":
       jev_op(fields)
     case other:
-      Fail{fail("unknown op: use exec, start, status, events, wait, stop, watch, validate or jev")}
+      Fail{fail("unknown op: use exec, start, spawn, write, closeInput, read, status, events, wait, stop, watch, list, capabilities, validate or jev")}
 
 def request(value: J.JSON) -> Result<&1, &1, Error, Op>:
   do Result<&1, &1, Error, Op>:
@@ -496,20 +778,62 @@ def watch(defaults: Defaults) -> U32:
     case Defaults{work, wait, watch}:
       watch
 
+def label_args(label: String) -> List<&2, String>:
+  match label:
+    case SNil{}:
+      Nil{}
+    case other:
+      ["--label", other]
+
+def input_args(pipe: Bool) -> List<&2, String>:
+  match pipe:
+    case True{}:
+      ["--input", "pipe"]
+    case False{}:
+      Nil{}
+
+def cwd_args(cwd: String) -> List<&2, String>:
+  match cwd:
+    case SNil{}:
+      Nil{}
+    case other:
+      ["--cwd", other]
+
+# Without waitMs, events is a snapshot under the control bound. With it, the
+# child long-polls for the requested time, cut to the session like `wait`.
+def events_plan(self: String, job: String, +after: U32, wait: Maybe<&2, U32>, +remaining: U32) -> Result<&1, &1, Error, Call>:
+  match wait:
+    case None{}:
+      control(cli(self, ["events", job, U32.show(after)]), remaining, True{})
+    case Some{requested}:
+      +ms : U32 = U32.min(requested, left(remaining))
+      timed(cli(self, ["events", "--timeout-ms", U32.show(ms), job, U32.show(after)]), "", ms, True{})
+
 def plan(+self: String, op: Op, defaults: Defaults, +remaining: U32) -> Result<&1, &1, Error, Call>:
   match op:
-    case Exec{argv, input, requested}:
+    case Exec{argv, input, requested, dir}:
       +ms : U32 = inner(requested, 3600000, remaining)
-      prefix : List<&2, String> = ["exec", "--timeout-ms", U32.show(ms), "--stdin", "--"]
+      prefix : List<&2, String> = List.append(
+        &2,
+        String,
+        ["exec", "--timeout-ms", U32.show(ms), "--stdin"],
+        List.append(&2, String, cwd_args(dir), ["--"]),
+      )
       timed(cli(self, List.append(&2, String, prefix, argv)), input, ms, False{})
-    case Start{argv, requested}:
+    case Start{argv, requested, label, dir, pipe}:
       lifetime : U32 = or(requested, work(defaults))
-      prefix : List<&2, String> = ["start", "--timeout-ms", U32.show(lifetime), "--"]
+      options : List<&2, String> = List.append(&2, String, label_args(label), List.append(&2, String, cwd_args(dir), input_args(pipe)))
+      prefix : List<&2, String> = List.append(
+        &2,
+        String,
+        ["start", "--timeout-ms", U32.show(lifetime)],
+        List.append(&2, String, options, ["--"]),
+      )
       control(cli(self, List.append(&2, String, prefix, argv)), remaining, False{})
     case Status{job}:
       control(cli(self, ["status", job]), remaining, False{})
-    case Events{job, after}:
-      control(cli(self, ["events", job, U32.show(after)]), remaining, True{})
+    case Events{job, after, wait}:
+      events_plan(self, job, after, wait, remaining)
     case Wait{job, requested}:
       +ms : U32 = inner(requested, wait(defaults), remaining)
       timed(cli(self, ["wait", "--timeout-ms", U32.show(ms), job]), "", ms, False{})
@@ -518,10 +842,10 @@ def plan(+self: String, op: Op, defaults: Defaults, +remaining: U32) -> Result<&
     case Watch{job, literal, requested}:
       +ms : U32 = inner(requested, watch(defaults), remaining)
       timed(cli(self, ["watch", "--timeout-ms", U32.show(ms), job, literal]), "", ms, True{})
-    case Validate{request}:
-      Fail{fail("validate runs in process")}
-    case Evaluate{request, requested}:
-      Fail{fail("jev runs in process")}
+    case ListJobs{sessions}:
+      control(cli(self, ["list"]), remaining, False{})
+    case other:
+      Fail{fail("this request runs in process")}
 
 # ---------------------------------------------------------------------------
 # CLI child output: JSON lines on stdout, or an error on stderr.
@@ -633,3 +957,113 @@ def respond(id: J.JSON, result: Result<&1, &1, Error, String>) -> String:
       (code, message) = e
       "{\"id\":" ++ encoded(id) ++ ",\"ok\":false,\"error\":{\"code\":" ++ U32.show(code)
         ++ ",\"message\":" ++ Json.quote(message) ++ "}}"
+
+# ---------------------------------------------------------------------------
+# Session children: spawned by one connection, addressed by `s-` ids, ended
+# with it. Each child's worker re-enters this executable and reads the
+# connection's pipe as the child's stdin.
+
+# Running session children one connection may hold, and the writes (and closes
+# and stops) one child may have queued.
+def children_max() -> Nat:
+  16n
+
+def pending_max() -> U32:
+  64
+
+# A worker's supervisor gives it this long past its child's own deadline to
+# record the receipt.
+def worker_grace() -> U32:
+  5000
+
+# The directory behind a session child's id, if `job` is one.
+def session_dir(job: String) -> Maybe<&2, String>:
+  match job:
+    case SCon{'s', SCon{'-', dir}}:
+      Some{dir}
+    case other:
+      None{}
+
+def unknown_child() -> Error:
+  (22, "unknown session child for this connection")
+
+def too_many_children() -> Error:
+  (22, "this connection already has 16 running session children")
+
+def too_many_pending() -> Error:
+  (1, "too many pending requests for this session child")
+
+# A session child lives for its own timeoutMs, or else for the rest of the
+# connection, and never past the connection less the receipt grace.
+def child_lifetime(requested: Maybe<&2, U32>, +left: U32) -> U32:
+  U32.min(or(requested, left), left)
+
+# How long the connection supervises the child's worker: the child's lifetime
+# and the grace, within a job's day.
+def worker_timeout(+lifetime: U32) -> U32:
+  U32.min(U32.add(lifetime, worker_grace()), Time.job_max())
+
+def mode(pipe: Bool) -> String:
+  match pipe:
+    case True{}:
+      "session"
+    case False{}:
+      "session-null"
+
+# `__job-worker <dir> <ms> <mode> <cwd> <argv...>`, as Jobs.worker_argv.
+def worker_argv(self: String, dir: String, +lifetime: U32, pipe: Bool, cwd: String, argv: List<&2, String>) -> List<&2, String>:
+  cli(self, Con{"__job-worker", Con{dir, Con{U32.show(lifetime), Con{mode(pipe), Con{cwd, argv}}}}})
+
+def utf8_bytes(text: String) -> Nat:
+  Jobs.utf8_bytes(text)
+
+def write_json(id: String, +written: Nat, closed: Bool) -> String:
+  Jobs.write_json(id, written, closed)
+
+
+# The job a request names, if any.
+def job_of(op: Op) -> Maybe<&2, String>:
+  match op:
+    case Status{job}:
+      Some{job}
+    case Events{job, after, wait}:
+      Some{job}
+    case Wait{job, timeout}:
+      Some{job}
+    case Stop{job}:
+      Some{job}
+    case Watch{job, literal, timeout}:
+      Some{job}
+    case Write{job, text}:
+      Some{job}
+    case CloseInput{job}:
+      Some{job}
+    case ReadOut{job, stream, offset, max, wait, base64}:
+      Some{job}
+    case other:
+      None{}
+
+def target_of(found: Maybe<&2, String>) -> Maybe<&2, String>:
+  match found:
+    case None{}:
+      None{}
+    case Some{+job}:
+      Bool.pick(Maybe<&2, String>, String.starts_with(job, "s-"), Some{job}, None{})
+
+# The session child a request names, by its full `s-` id.
+def session_target(op: Op) -> Maybe<&2, String>:
+  target_of(job_of(op))
+
+# The same observation, pointed at the child's directory for a CLI child.
+def retarget(op: Op, dir: String) -> Op:
+  match op:
+    case Status{job}:
+      Status{dir}
+    case Events{job, after, wait}:
+      Events{dir, after, wait}
+    case Wait{job, timeout}:
+      Wait{dir, timeout}
+    case Watch{job, literal, timeout}:
+      Watch{dir, literal, timeout}
+    case other:
+      other

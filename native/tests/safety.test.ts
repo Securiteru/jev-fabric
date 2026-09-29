@@ -6,7 +6,7 @@ import { expectFixture } from './helpers.ts';
 function fixture(pure = 'import Base\ndef value() -> Nat:\n  0n\n') {
   const manifest: Manifest = {
     schemaVersion: 1,
-    compiler: 'bend 2.0.27',
+    compiler: 'bend 2.0.34',
     pure: ['native/Pure.bend'],
     proofs: [],
     drivers: ['native/Driver.bend'],
@@ -78,10 +78,20 @@ test('native safe encoder fuel and pure effect gates execute as specified', () =
 }, 100000);
 
 test('compiler trust warnings and incomplete verdicts fail in the pure proof closure', () => {
-  acceptVerdict('pure', 'All terms check.\n', true);
-  const warning = 'All terms check, but 1 def relies on unsafe or foreign code:\n- run\n';
-  expect(() => acceptVerdict('pure', warning, true)).toThrow(/trust verdict/);
-  acceptVerdict('driver', warning, false);
-  const incomplete = 'All terms check, but incomplete.';
-  expect(() => acceptVerdict('pure', incomplete, true)).toThrow(/trust verdict/);
+  const clean = 'ALL PROOFS CHECK\nUse --verdict for mathematical validity.\n';
+  acceptVerdict('pure', clean, true, 0);
+  expect(() => acceptVerdict('pure', clean, true, 1)).toThrow(/trust verdict/);
+  const warning = 'SOME PROOFS FAIL\nError: 1 def relies on unsafe or foreign code:\n- run\n';
+  expect(() => acceptVerdict('pure', warning, true, 1)).toThrow(/trust verdict/);
+  acceptVerdict('driver', warning, false, 1);
+  expect(() => acceptVerdict('driver', warning, false, 0)).toThrow(/trust verdict/);
+  const imported = 'SOME PROOFS FAIL\nError: 2 defs rely on unsafe or foreign code:\n- ../Host.jfh_os\n- run\n';
+  acceptVerdict('driver', imported, false, 1);
+  const incomplete = 'SOME PROOFS FAIL\nError: 1 TODO found.\nThe code is incomplete, and not a valid proof yet.';
+  expect(() => acceptVerdict('pure', incomplete, true, 1)).toThrow(/trust verdict/);
+  expect(() => acceptVerdict('driver', incomplete, false, 1)).toThrow(/trust verdict/);
+  const typeError = 'SOME PROOFS FAIL\nError:\n- expected : Nat\n- observed : U32\nLocation: f';
+  expect(() => acceptVerdict('driver', typeError, false, 1)).toThrow(/trust verdict/);
+  // The pre-2.0.32 wording is no longer a clean verdict.
+  expect(() => acceptVerdict('pure', 'All terms check.', true, 0)).toThrow(/trust verdict/);
 });

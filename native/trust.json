@@ -1,16 +1,17 @@
 {
   "schemaVersion": 1,
-  "compiler": "bend 2.0.27",
+  "compiler": "bend 2.0.34",
   "pure": [
     "native/TimeCore.bend", "native/Cli.bend", "native/Core.bend", "native/Json.bend", "native/Codec.bend", "native/Wire.bend",
     "native/Streams.bend", "native/MonitorCore.bend", "native/HttpCore.bend",
-    "native/CredentialCore.bend", "native/JevCore.bend", "native/ServeCore.bend", "native/vendor/strict-json/json.bend"
+    "native/CredentialCore.bend", "native/JevCore.bend", "native/ServeCore.bend", "native/JobsCore.bend", "native/StoreCore.bend",
+    "native/SpoolCore.bend", "native/vendor/strict-json/json.bend"
   ],
   "proofs": ["native/tests/proofs.bend", "native/tests/policy-proofs.bend", "native/tests/time-proofs.bend"],
   "drivers": [
     "native/Time.bend", "native/Scope.bend", "native/Process.bend", "native/Host.bend", "native/Http.bend", "native/Credentials.bend",
     "native/Jev.bend", "native/Monitor.bend", "native/Jobs.bend", "native/Session.bend",
-    "native/Runner.bend", "native/Input.bend", "native/Serve.bend", "native/main.bend"
+    "native/Runner.bend", "native/Input.bend", "native/Spool.bend", "native/Serve.bend", "native/main.bend"
   ],
   "foreign": {
     "native/Process.bend": {

@@ -12,18 +12,32 @@ extern char **environ;
 
 #define JF_TAIL 32768
 #define JF_ARGS 64
-#define JF_JOBS 8
+#define JF_JOBS 32
 #define JF_ARG_BYTES 4096
 #define JF_SPOOL_LIMIT 1048576
 #define JF_LIMIT_MAX 1048580
 #define JF_TEXT_INPUT_MAX 131072u
 #define JF_BYTES_INPUT_MAX 4194304u
 #define JF_TIMEOUT_MAX_MS 3600000
+// Only exec_logged and rolling exec_pipe, the job and session workers' effects, accept a day.
+#define JF_JOB_TIMEOUT_MAX_MS 86400000
 #define JF_TIMEOUT_EXIT 124
 #define JF_NS_PER_MS 1000000ull
 // After the child exits, keep draining pipes held by escaped descendants this long.
 #define JF_DRAIN_GRACE_NS 100000000ull
 #define JF_POLL_MS 10
+// A cancelled group gets SIGTERM, then SIGKILL once this grace has passed.
+#define JF_TERM_GRACE_NS 500000000ull
+// Rolling spools: a 16-byte header (bytes written as a little-endian u64, then a
+// u64 of flags, bit 0 meaning the stream has ended) and a ring of this many bytes.
+#define JF_RING 1048576
+#define JF_RING_HEAD 16
+#define JF_CWD_MAX 4096
+
+#ifdef __linux__
+// glibc 2.29+; declared here in case the build's feature macros hide it.
+extern int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t *, const char *);
+#endif
 
 // Report flags; Process.decode reads the same bits.
 enum {
@@ -49,6 +63,8 @@ typedef struct {
   int bytes;
   int logs[2];
   size_t logged[2];
+  int rolling;
+  char *cwd;
   int log_error;
   size_t out_len;
   size_t err_len;
@@ -134,8 +150,57 @@ static void jf_tail(
   }
 }
 
-// Append to the stream's spool file until it holds JF_SPOOL_LIMIT bytes.
+// Publishes a rolling spool's header: the bytes written so far and the flags.
+static void jf_ring_head(JfExec *job, int stream, u64 flags) {
+  unsigned char head[JF_RING_HEAD];
+  u64 count = (u64)job->logged[stream];
+  for (int i = 0; i < 8; i++) {
+    head[i] = (unsigned char)(count >> (8 * i));
+    head[8 + i] = (unsigned char)(flags >> (8 * i));
+  }
+  size_t used = 0;
+  while (used < sizeof head) {
+    ssize_t put = pwrite(job->logs[stream], head + used, sizeof head - used, (off_t)used);
+    if (put > 0) {
+      used += (size_t)put;
+    } else if (put < 0 && errno == EINTR) {
+      continue;
+    } else {
+      job->log_error = put < 0 ? errno : EIO;
+      return;
+    }
+  }
+}
+
+// Writes into the ring at the running offset, wrapping, then publishes the new count.
+// Data is written before the header, so a reader never sees a count ahead of its bytes.
+static void jf_ring(JfExec *job, int stream, const char *data, size_t length) {
+  while (length) {
+    size_t at = job->logged[stream] % JF_RING;
+    size_t room = JF_RING - at;
+    size_t chunk = length < room ? length : room;
+    ssize_t put = pwrite(job->logs[stream], data, chunk, (off_t)(JF_RING_HEAD + at));
+    if (put > 0) {
+      job->logged[stream] += (size_t)put;
+      data += put;
+      length -= (size_t)put;
+    } else if (put < 0 && errno == EINTR) {
+      continue;
+    } else {
+      job->log_error = put < 0 ? errno : EIO;
+      return;
+    }
+  }
+  jf_ring_head(job, stream, 0);
+}
+
+// Append to the stream's spool file until it holds JF_SPOOL_LIMIT bytes, or
+// keep its latest JF_RING bytes when the spool is rolling.
 static void jf_spool(JfExec *job, int stream, const char *data, size_t length) {
+  if (job->logs[stream] >= 0 && job->rolling) {
+    jf_ring(job, stream, data, length);
+    return;
+  }
   if (job->logs[stream] < 0 || job->logged[stream] >= JF_SPOOL_LIMIT) {
     return;
   }
@@ -190,6 +255,7 @@ static void jf_exec_call(IoWork *w) {
   int slot = -1;
   size_t sent = 0;
   u64 exited_at = 0;
+  u64 term_at = 0;
   posix_spawn_file_actions_t actions;
   posix_spawnattr_t attr;
   int have_actions = 0;
@@ -214,6 +280,17 @@ static void jf_exec_call(IoWork *w) {
   if (jf_interrupt) {
     w->code = EINTR;
     goto cleanup;
+  }
+  if (job->rolling) {
+    for (int s = 0; s < 2; s++) {
+      if (job->logs[s] >= 0) {
+        jf_ring_head(job, s, 0);
+      }
+    }
+    if (job->log_error) {
+      w->code = job->log_error;
+      goto cleanup;
+    }
   }
   // A caller-provided stdin reader is not re-piped here: in_pipe[0] carries it so
   // the spawn file action and every cleanup path close that one fd.
@@ -255,11 +332,37 @@ static void jf_exec_call(IoWork *w) {
       || (w->code = posix_spawn_file_actions_adddup2(&actions, err_pipe[1], STDERR_FILENO))) {
     goto cleanup;
   }
+  if (job->cwd && job->cwd[0]) {
+#pragma clang diagnostic push
+#pragma clang diagnostic ignored "-Wdeprecated-declarations"
+    w->code = posix_spawn_file_actions_addchdir_np(&actions, job->cwd);
+#pragma clang diagnostic pop
+    if (w->code) {
+      goto cleanup;
+    }
+  }
+  // A rolling child that reads this process's own stdin (a session worker
+  // passing on its owner's pipe) takes it over: once it has started, this
+  // process lets go of fd 0, so the owner's writes fail once the child is gone.
+  int release_stdin = 0;
+  if (job->rolling && in_pipe[0] >= 0) {
+    struct stat given;
+    struct stat own;
+    release_stdin = fstat(in_pipe[0], &given) == 0 && fstat(STDIN_FILENO, &own) == 0
+      && given.st_dev == own.st_dev && given.st_ino == own.st_ino;
+  }
   pthread_mutex_lock(&jf_gate);
   if (jf_shutdown) {
     w->code = ECANCELED;
   } else {
     w->code = posix_spawnp(&pid, job->argv[0], &actions, &attr, job->argv, environ);
+  }
+  if (!w->code && release_stdin) {
+    int none = open("/dev/null", O_RDONLY | O_CLOEXEC);
+    if (none >= 0) {
+      dup2(none, STDIN_FILENO);
+      close(none);
+    }
   }
   if (!w->code) {
     jf_pids[slot] = pid;
@@ -281,10 +384,15 @@ static void jf_exec_call(IoWork *w) {
   }
   u64 deadline = io_tick() + (u64)job->timeout * JF_NS_PER_MS;
   while (!done || out_pipe[0] >= 0 || err_pipe[0] >= 0) {
+    // Stop the group, then force it once the grace has passed.
     if (!done && jf_interrupt && !(job->flags & JF_CANCELLED)) {
       job->flags |= JF_CANCELLED;
       job->code = 128 + jf_interrupt;
+      kill(-pid, SIGTERM);
+      term_at = io_tick();
+    } else if (!done && term_at && io_tick() - term_at >= JF_TERM_GRACE_NS) {
       kill(-pid, SIGKILL);
+      term_at = 0;
     }
     if (!done && io_tick() >= deadline && !(job->flags & (JF_TIMED_OUT | JF_CANCELLED))) {
       job->flags |= JF_TIMED_OUT;
@@ -377,9 +485,9 @@ cleanup:
 }
 
 static Term jf_bytes(Env e, const char *data, size_t size) {
-  Term xs = term_pak(CID_NIL, 0);
+  Term xs = term_pak(CID(Nil), 0);
   for (size_t i = size; i > 0; i--) {
-    xs = io_node(e, CID_CON, (uint8_t)data[i - 1], xs);
+    xs = io_node(e, CID(Con), (uint8_t)data[i - 1], xs);
   }
   return xs;
 }
@@ -407,6 +515,13 @@ static Term jf_exec_pack(Env e, IoWork *w) {
   if (job->logs[0] == job->logs[1]) {
     job->logs[1] = -1;
   }
+  // A rolling stream has ended once its supervisor has: mark it for readers.
+  for (int s = 0; s < 2 && job->rolling; s++) {
+    if (job->logs[s] >= 0) {
+      jf_ring_head(job, s, 1);
+    }
+  }
+  free(job->cwd);
   jf_close(&job->logs[0]);
   jf_close(&job->logs[1]);
   jf_close(&job->stdin_fd);
@@ -426,13 +541,23 @@ static Term jf_exec_start(
   int bytes,
   int log_out,
   int log_err,
-  int stdin_fd
+  int stdin_fd,
+  u32 timeout_max,
+  int rolling,
+  Term cwd
 ) {
   JfExec *job = io_mem(calloc(1, sizeof *job));
   w->data = (char *)job;
   w->code = 0;
   job->logs[0] = log_out;
   job->logs[1] = log_err;
+  job->rolling = rolling;
+  u64 cwd_len = 0;
+  job->cwd = io_cstr(e, cwd, &cwd_len);
+  // A working directory is absolute or empty (inherit); spawn reports a missing one.
+  if (cwd_len > JF_CWD_MAX || io_nul(job->cwd, cwd_len) || (cwd_len && job->cwd[0] != '/')) {
+    w->code = EINVAL;
+  }
   for (int i = 0; i < 2; i++) {
     if (job->logs[i] >= 0) {
       struct stat st;
@@ -442,7 +567,7 @@ static Term jf_exec_start(
     }
   }
   Term args = f[0];
-  while (term_aux(args) == CID_CON) {
+  while (term_aux(args) == CID(Con)) {
     Term fields[2];
     spare_free(e, cls_fit(2), ctr_take(e, args, 2, fields));
     u64 length = 0;
@@ -463,7 +588,7 @@ static Term jf_exec_start(
   job->limit = limit;
   u64 input_max = bytes ? JF_BYTES_INPUT_MAX : JF_TEXT_INPUT_MAX;
   if (!job->argc || !job->argv[0][0] || job->input_len > input_max
-      || !job->timeout || job->timeout > JF_TIMEOUT_MAX_MS
+      || !job->timeout || job->timeout > timeout_max
       || !limit || limit > JF_LIMIT_MAX
       || stdin_fd < -1 || (stdin_fd >= 0 && inherit)) {
     w->code = EINVAL;
@@ -478,45 +603,50 @@ static Term jf_exec_start(
   return w->code ? jf_exec_pack(e, w) : io_work(w, jf_exec_call, jf_exec_pack);
 }
 
-#ifdef CID_NATIVE_EXEC
+#ifdef CID(Native.exec)
 Term native_exec_run(Env e, Term *f, IoWork *w) {
-  int inherit = term_aux(f[3]) == CID_TRUE;
-  return jf_exec_start(e, f, w, JF_TAIL, inherit, 0, -1, -1, -1);
+  int inherit = term_aux(f[3]) == CID(True);
+  return jf_exec_start(e, f, w, JF_TAIL, inherit, 0, -1, -1, -1, JF_TIMEOUT_MAX_MS, 0, f[4]);
 }
 #endif
 
-#ifdef CID_NATIVE_CAPTURE
+#ifdef CID(Native.capture)
 Term native_capture_run(Env e, Term *f, IoWork *w) {
-  return jf_exec_start(e, f, w, (u32)f[3], 0, 1, -1, -1, -1);
+  Term none = term_pak(CID(SNil), 0);
+  return jf_exec_start(e, f, w, (u32)f[3], 0, 1, -1, -1, -1, JF_TIMEOUT_MAX_MS, 0, none);
 }
 #endif
 
-#ifdef CID_NATIVE_EXEC_LOGGED
+#ifdef CID(Native.exec_logged)
 Term native_exec_logged_run(Env e, Term *f, IoWork *w) {
-  Term args[3] = {f[0], term_pak(CID_SNIL, 0), f[1]};
+  Term args[3] = {f[0], term_pak(CID(SNil), 0), f[1]};
   int log_out = (int)io_hand_v(f[2]);
   int log_err = (int)io_hand_v(f[3]);
-  return jf_exec_start(e, args, w, JF_TAIL, 0, 0, log_out, log_err, -1);
+  return jf_exec_start(e, args, w, JF_TAIL, 0, 0, log_out, log_err, -1, JF_JOB_TIMEOUT_MAX_MS, 0, f[4]);
 }
 #endif
 
 // Interactive sibling of exec_logged: the child's stdin is a caller-provided
 // pipe reader (consumed and closed after dup2), while stdout/stderr spool to
-// the given writer handles exactly as exec_logged does.
-#ifdef CID_NATIVE_EXEC_PIPE
+// the given writer handles as exec_logged does, or, when rolling, keep the
+// latest JF_RING bytes of each stream behind a published header. A rolling
+// child may live for a day, like a job; the first-byte form keeps the hour.
+#ifdef CID(Native.exec_pipe)
 Term native_exec_pipe_run(Env e, Term *f, IoWork *w) {
-  Term args[3] = {f[0], term_pak(CID_SNIL, 0), f[2]};
+  Term args[3] = {f[0], term_pak(CID(SNil), 0), f[2]};
   int stdin_fd = (int)io_hand_v(f[1]);
   int log_out = (int)io_hand_v(f[3]);
   int log_err = (int)io_hand_v(f[4]);
-  return jf_exec_start(e, args, w, JF_TAIL, 0, 0, log_out, log_err, stdin_fd);
+  int rolling = term_aux(f[5]) == CID(True);
+  u32 max = rolling ? JF_JOB_TIMEOUT_MAX_MS : JF_TIMEOUT_MAX_MS;
+  return jf_exec_start(e, args, w, JF_TAIL, 0, 0, log_out, log_err, stdin_fd, max, rolling, f[6]);
 }
 #endif
 
-#ifdef CID_NATIVE_CANCEL
+#ifdef CID(Native.cancel)
 Term native_cancel_run(Env e, Term *f, IoWork *w) {
   jf_signal(SIGTERM);
-  return term_pak(CID_UNIT, 0);
+  return term_pak(CID(Unit), 0);
 }
 #endif
 
@@ -529,19 +659,19 @@ static void __attribute__((constructor)) native_exec_use(void) {
   sigaction(SIGTERM, &action, NULL);
   signal(SIGPIPE, SIG_IGN);
   atexit(jf_cleanup);
-#ifdef CID_NATIVE_EXEC
-  io_eff(CID_NATIVE_EXEC, native_exec_run, 0);
+#ifdef CID(Native.exec)
+  io_eff(CID(Native.exec), native_exec_run, 0);
 #endif
-#ifdef CID_NATIVE_CAPTURE
-  io_eff(CID_NATIVE_CAPTURE, native_capture_run, 0);
+#ifdef CID(Native.capture)
+  io_eff(CID(Native.capture), native_capture_run, 0);
 #endif
-#ifdef CID_NATIVE_EXEC_LOGGED
-  io_eff(CID_NATIVE_EXEC_LOGGED, native_exec_logged_run, 0);
+#ifdef CID(Native.exec_logged)
+  io_eff(CID(Native.exec_logged), native_exec_logged_run, 0);
 #endif
-#ifdef CID_NATIVE_EXEC_PIPE
-  io_eff(CID_NATIVE_EXEC_PIPE, native_exec_pipe_run, 0);
+#ifdef CID(Native.exec_pipe)
+  io_eff(CID(Native.exec_pipe), native_exec_pipe_run, 0);
 #endif
-#ifdef CID_NATIVE_CANCEL
-  io_eff(CID_NATIVE_CANCEL, native_cancel_run, 0);
+#ifdef CID(Native.cancel)
+  io_eff(CID(Native.cancel), native_cancel_run, 0);
 #endif
 }

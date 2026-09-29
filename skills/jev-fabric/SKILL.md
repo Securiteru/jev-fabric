@@ -16,7 +16,8 @@ command starts with `jev-fabric --`.
 ## Check the install
 
 ```bash
-jev-fabric -- --version        # 0.3.1-native (Bend 2.0.27)
+jev-fabric -- --version        # 0.5.0-native (Bend 2.0.34)
+jev-fabric -- capabilities     # {"version":…,"protocol":2,"store":1,"platform":…,"features":[…]}
 ```
 
 If it is missing, install the release binary (macOS universal, Linux x64/arm64):
@@ -36,6 +37,7 @@ jev-fabric -- exec /bin/echo hello                       # literal argv, no shel
 jev-fabric -- exec --timeout-ms 5000 -- make test        # bounded ceiling
 printf 'input\n' | jev-fabric -- exec --stdin /bin/cat   # forward stdin
 jev-fabric -- exec /bin/sh -c 'ls | wc -l'               # shells are explicit
+jev-fabric -- exec --cwd /abs/project -- make test       # start in another directory
 ```
 
 The receipt is one JSON line: `state` (`exited`, `failed`, `timed_out`,
@@ -46,17 +48,44 @@ succeeded: read the output and verify.
 ## Background jobs that outlive the tool call
 
 ```bash
-id=$(jev-fabric -- start /bin/sh -c 'npm run dev' | jq -r .id)
+id=$(jev-fabric -- start --label dev /bin/sh -c 'npm run dev' | jq -r .id)
 jev-fabric -- status "$id"             # running state or final receipt
 jev-fabric -- watch "$id" ready        # lines containing "ready" until exit or 5 s
+jev-fabric -- follow "$id"             # live JSONL events until exit or 30 s
 jev-fabric -- events "$id"             # bounded JSONL replay (last 64 events)
 jev-fabric -- events "$id" 12          # only events after sequence 12
 jev-fabric -- wait --timeout-ms 60000 "$id"   # waiting never cancels the job
 jev-fabric -- stop "$id"               # idempotent cooperative stop
+jev-fabric -- list                     # all jobs here, newest first, with labels
+jev-fabric -- read "$id" stdout 0      # raw bytes by offset: {"text":…,"next":N,"omittedBytes":0,…}
 ```
 
+An interactive job keeps its stdin open and survives your tool call:
+
+```bash
+id=$(jev-fabric -- start --input pipe -- python3 -u -i | jq -r .id)
+printf 'print(6 * 7)\n' | jev-fabric -- write "$id" --stdin   # include the newline
+jev-fabric -- read --wait-ms 5000 "$id" stdout 0              # then read from "next"
+jev-fabric -- close-input "$id"
+```
+
+Writes are queued (1 MiB at most) and reach the child within 25 ms; for
+millisecond round trips from code, use a `serve` session child instead.
+
 - Job IDs are random, not PIDs. Storage is `.jev-fabric-native/` in the current
-  directory, or `JEV_FABRIC_HOME`. Run controls from the same directory/home.
+  directory (created with a `.gitignore`), or `JEV_FABRIC_HOME`. Run controls
+  from the same directory/home; any agent or program sharing it sees the same
+  jobs, so `list` finds work started earlier or by another harness. `start
+  --cwd DIR` runs the job elsewhere without moving that storage.
+- A storage home written by a newer jev-fabric is refused with exit code 22
+  (`storage home uses store format N`): upgrade rather than work around it.
+- `--label TEXT` (1..120 printable characters, one line) names a job; `status`,
+  `wait`, `stop` and `list` report it. `start --timeout-ms` may be up to
+  86400000 (24 h) for dev servers; the default lifetime stays 1 h.
+- `follow <id> [after]` prints each event as it is published, a `follow.loss`
+  record if older events were evicted, and one final
+  `{"type":"follow.end","reason":"finished"|"timeout","next":N,"receipt":{...}}`.
+  Resume with `follow <id> N`. A timeout never stops the job.
 - `watch` returns `monitor.batch` lines (≤32 per batch), `monitor.loss` records when
   output was dropped, and a final `monitor.end` summary. A match is an observation,
   not proof of completion.
@@ -116,10 +145,11 @@ session, the credential resolves once and the TLS connection stays warm.
 jev-fabric -- serve --timeout-ms 600000 20 50000   # 10 min, ≤20 Jev calls, ≤50000 tokens
 ```
 
-Write one JSON request per line; read one response per line, in order:
+Write one JSON request per line; read one response per line and match it by
+`id`: requests run concurrently, so responses can arrive out of order.
 
 ```text
-← {"ready":{"protocol":1,"version":"0.3.1-native",...}}
+← {"ready":{"protocol":2,"version":"0.5.0-native","store":1,"features":[...],...}}
 → {"id":1,"op":"start","argv":["/bin/sh","-c","npm run dev"]}
 ← {"id":1,"ok":true,"result":{"id":"<job>"}}
 → {"id":2,"op":"watch","job":"<job>","literal":"ready","timeoutMs":30000}
@@ -128,10 +158,26 @@ Write one JSON request per line; read one response per line, in order:
 ← {"id":3,"ok":false,"error":{"code":1,"message":"Jev budget exhausted"}}
 ```
 
-Ops: `exec` (`argv`, `stdin?`), `start` (`argv`), `status`/`stop` (`job`),
-`events` (`job`, `after?`), `wait` (`job`), `watch` (`job`, `literal`),
-`validate`/`jev` (`request`); most take `timeoutMs?`. Unknown fields are
-rejected. Close stdin to end the session. Ready-made single-file clients live in
+Ops: `exec` (`argv`, `stdin?`, `cwd?`), `start` (`argv`, `label?`, `cwd?`),
+`status`/`stop` (`job`), `events` (`job`, `after?`, `waitMs?` for a long poll),
+`wait` (`job`), `watch` (`job`, `literal`), `list` (`scope?`), `capabilities`,
+`validate`/`jev` (`request`, `provider?`, `credential?`); most take `timeoutMs?`.
+Unknown fields are rejected. Close stdin to end the session.
+
+For an interactive process driven from code (a REPL, a language server, a game
+bridge), `spawn` a **session child**: it ends with the session, its stdin stays
+open, and its output is read by byte offset.
+
+```text
+→ {"id":1,"op":"spawn","argv":["python3","-u","-i"]}          # → {"id":"s-…",…}
+→ {"id":2,"op":"write","job":"s-…","text":"print(6 * 7)\n"}    # → {"written":13,…}
+→ {"id":3,"op":"read","job":"s-…","stream":"stdout","offset":0,"waitMs":5000}
+← {"id":3,"ok":true,"result":{"offset":0,"bytes":3,"omittedBytes":0,"text":"42\n","next":3,"eof":false,…}}
+```
+
+Read from `next` each time; `omittedBytes` above zero means the 1 MiB rolling
+window moved past your offset. `closeInput` sends end of input; `stop`, `wait`,
+`status` and `events` take the `s-` id too. Ready-made single-file clients live in
 `~/.local/share/jev-fabric/current/clients/` (`python/jev_fabric.py`,
 `typescript/jev-fabric.ts`). The protocol reference is `docs/serve-protocol.md`
 in the repository.
@@ -143,7 +189,7 @@ shared deadline scopes (a game bot, a crawler, a supervisor), write a Bend
 program against the library and run it:
 
 ```bash
-jev-fabric -- run program.bend arg1 arg2     # compiles (needs `bend` 2.0.27), then runs
+jev-fabric -- run program.bend arg1 arg2     # compiles (needs `bend` 2.0.34), then runs
 ```
 
 HTTPS keeps one pooled TLS connection per process, so a Bend program or a
@@ -155,7 +201,8 @@ invocations. See
 
 - Trusted native execution, **not a sandbox**. Commands run with your privileges.
 - Shell syntax only happens when you invoke a shell explicitly.
-- Logs are bounded observations: the first 1 MiB per stream is spooled, receipts
-  keep 32 KiB tails, events keep the latest 64. Disclosed loss, never silent.
+- Logs are bounded observations: the first 1 MiB per stream is spooled (the
+  latest 1 MiB for session children), receipts keep 32 KiB tails, events keep
+  the latest 64. Disclosed loss, never silent.
 - No restart recovery, exactly-once execution or rollback. A crashed worker is
   reported failed, not resumed.

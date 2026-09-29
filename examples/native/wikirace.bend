@@ -292,5 +292,7 @@ def start(args: List<String>) -> IO(Unit):
 # (at most 120). Usage: jev-fabric -- run examples/native/wikirace.bend <from> <to>
 def main() -> IO(Unit):
   do IO<Unit>:
-    args : List<String> <- IO.args()
+    # IO.args() starts with the program as invoked (Bend 2.0.32+).
+    invoked : List<String> <- IO.args()
+    args : List<String> = List.drop(&1, String, invoked, 1n)
     start(args)

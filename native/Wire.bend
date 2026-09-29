@@ -485,6 +485,11 @@ def decimal_le(a: Decimal, b: Decimal) -> Bool:
       b_fraction = pad_fraction(bf, String.length(af))
       Nat.is_lt(aw, bw) || (Nat.is_eq(aw, bw) && String.is_le(a_fraction, b_fraction))
 
+# The native Nat cap, 2^48 - 1 (281474976710655). Base's Nat.read.max was
+# removed in Bend 2.0.28; the bound itself is unchanged.
+def nat_max() -> Nat:
+  Nat.mul(U32.to_nat(16777215), U32.to_nat(16777217))
+
 # Token counts of a response that has already passed Codec.validate.
 def usage_counts(value: J.JSON) -> Result<&1, &1, U32 & String, Nat & Nat>:
   do Result<&1, &1, U32 & String, Nat & Nat>:
@@ -492,8 +497,8 @@ def usage_counts(value: J.JSON) -> Result<&1, &1, U32 & String, Nat & Nat>:
     +fields : List<&2, J.JSON> <- object(u)
     i : J.JSON <- need(J.Obj{fields}, "input_tokens")
     o : J.JSON <- need(J.Obj{fields}, "output_tokens")
-    input : Nat <- scalar(i, 0n, Nat.read.max())
-    output : Nat <- scalar(o, 0n, Nat.read.max())
+    input : Nat <- scalar(i, 0n, nat_max())
+    output : Nat <- scalar(o, 0n, nat_max())
     return (input, output)
 
 def usage(value: J.JSON) -> Result<&1, &1, U32 & String, Nat & Nat>:

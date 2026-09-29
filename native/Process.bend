@@ -5,12 +5,14 @@ import ./Time.bend as Time
 def Raw() -> Type:
   U32 & (U32 & (String & String))
 
-# Custom foreign effects. These are native C, not JavaScript.
+# Custom foreign effects. These are native C, not JavaScript. A `cwd` is an
+# absolute directory the child starts in, or "" to inherit this process's.
 def Native.exec(
   argv: List<String>,
   input: String,
   timeout_ms: U32,
   inherit_stdin: Bool,
+  cwd: String,
 ) -> IO(Result<&1, &1, U32 & String, Raw>):
   import "./posix.c"
 
@@ -80,23 +82,31 @@ def decode(raw: Raw) -> Report:
   stderr_cut = flag_set(flags, 4)
   Report{code, timed_out, cancelled, stdout_cut, stderr_cut, stdout, stderr}
 
-def run(argv: List<String>, input: String, timeout_ms: U32) -> IO(Report):
+# Bend 2.0.28+ Base owns `Process.run`, so the explicit-timer buffered form is
+# `run_input`, the counterpart of `exec_input`.
+def run_input(argv: List<String>, input: String, timeout_ms: U32) -> IO(Report):
   do IO<Report>:
-    raw : Raw <- IO.try(Raw, Native.exec(argv, input, timeout_ms, False{}))
+    raw : Raw <- IO.try(Raw, Native.exec(argv, input, timeout_ms, False{}, ""))
+    return decode(raw)
+
+# As run_input or run_stdin, started in `cwd` (absolute, or "" to inherit).
+def run_in(argv: List<String>, input: String, timeout_ms: U32, inherit_stdin: Bool, cwd: String) -> IO(Report):
+  do IO<Report>:
+    raw : Raw <- IO.try(Raw, Native.exec(argv, input, timeout_ms, inherit_stdin, cwd))
     return decode(raw)
 
 # Timer-free convenience; use run for an explicit local override.
 def exec_input(argv: List<String>, input: String) -> IO(Report):
   do IO<Report>:
     ms : U32 <- Time.work()
-    run(argv, input, ms)
+    run_input(argv, input, ms)
 
 def exec(argv: List<String>) -> IO(Report):
   exec_input(argv, "")
 
 def run_stdin(argv: List<String>, timeout_ms: U32) -> IO(Report):
   do IO<Report>:
-    raw : Raw <- IO.try(Raw, Native.exec(argv, "", timeout_ms, True{}))
+    raw : Raw <- IO.try(Raw, Native.exec(argv, "", timeout_ms, True{}, ""))
     return decode(raw)
 
 def exec_stdin(argv: List<String>) -> IO(Report):
@@ -112,30 +122,52 @@ def Native.exec_logged(
   timeout_ms: U32,
   stdout: File,
   stderr: File,
+  cwd: String,
 ) -> IO(Result<&1, &1, U32 & String, Raw>):
   import "./posix.c"
 
 # Interactive sibling of exec_logged: input is the read end of a stdin pipe
 # the effect consumes and closes; stdout/stderr are spool writer handles it
-# consumes too. Deadlines, process-group cleanup, tails and spool bounds match.
+# consumes too. Deadlines, process-group cleanup and tails match. Spools keep
+# the first 1 MiB, or with `rolling` the latest 1 MiB behind a header that
+# publishes the bytes written and when the stream ended (see SpoolCore).
 def Native.exec_pipe(
   argv: List<String>,
   input: File,
   timeout_ms: U32,
   stdout: File,
   stderr: File,
+  rolling: Bool,
+  cwd: String,
 ) -> IO(Result<&1, &1, U32 & String, Raw>):
   import "./posix.c"
 
-def run_logged(
+def logged_within(
   argv: List<String>,
   timeout_ms: U32,
   stdout: File,
   stderr: File,
+  within: Bool,
 ) -> IO(Report):
-  do IO<Report>:
-    raw : Raw <- IO.try(Raw, Native.exec_logged(argv, timeout_ms, stdout, stderr))
-    return decode(raw)
+  match within:
+    case True{}:
+      do IO<Report>:
+        raw : Raw <- IO.try(Raw, Native.exec_logged(argv, timeout_ms, stdout, stderr, ""))
+        return decode(raw)
+    case False{}:
+      do IO<Report>:
+        File.close(stdout)
+        File.close(stderr)
+        IO.die(Report, 22, "run_logged timeout must be 1..3600000 milliseconds")
+
+# The effect itself admits a detached job's day; this API keeps the hour.
+def run_logged(
+  argv: List<String>,
+  +timeout_ms: U32,
+  stdout: File,
+  stderr: File,
+) -> IO(Report):
+  logged_within(argv, timeout_ms, stdout, stderr, U32.is_le(timeout_ms, Time.max_timeout()))
 
 def state_code(success: Bool) -> String:
   match success:

@@ -52,10 +52,22 @@ to pin a release or `JEV_FABRIC_PREFIX` to change the prefix.
 Update any time with `jev-fabric -- update`. Like `bend update`, it prints and
 runs the same `curl … | sh`, and the variables above still apply.
 
+From npm, with no install script or download at install time:
+
+```sh
+npx jev-fabric -- --version                    # or: npm install -g jev-fabric
+```
+
+npm installs only the matching `jev-fabric-darwin`, `jev-fabric-linux-x64` or
+`jev-fabric-linux-arm64` package (Linux builds need glibc 2.28 or newer). Hosts
+that embed jev-fabric call `require("jev-fabric").binaryPath()` and spawn the
+executable directly; the `serve` clients ship in the package too. Pi Fabric
+prefers your own compatible install and falls back to this package.
+
 <details>
 <summary>Build from source</summary>
 
-Requires **Bend 2.0.27**, Clang and Bun (for the build-time safety gate).
+Requires **Bend 2.0.34**, Clang and Bun (for the build-time safety gate).
 
 ```sh
 sh scripts/build-native.sh             # or: bun run build
@@ -64,18 +76,23 @@ build/jev-fabric -- --help
 
 </details>
 
-## Seven verbs. Every process.
+## A handful of verbs. Every process.
 
 ```sh
 jev-fabric -- exec /bin/echo hello                        # literal argv, bounded receipt
 printf 'hi\n' | jev-fabric -- exec --stdin /bin/cat         # forward stdin
 jev-fabric -- run examples/native/pipeline.bend             # compile + run Bend (needs bend)
 
-id=$(jev-fabric -- start /bin/sh -c 'npm run dev' | jq -r .id)   # survives its launcher
+id=$(jev-fabric -- start --label dev /bin/sh -c 'npm run dev' | jq -r .id)   # survives its launcher
 jev-fabric -- watch "$id" ready                            # live, filtered, bounded lines
+jev-fabric -- follow "$id"                                 # live JSONL events until it ends
 jev-fabric -- events "$id"                                 # bounded JSONL replay
 jev-fabric -- wait "$id"                                   # waiting never cancels
 jev-fabric -- stop "$id"                                   # idempotent, never signals a stale PID
+jev-fabric -- list                                         # every job in this storage root
+jev-fabric -- read "$id" stdout 0                          # raw bytes by offset
+jev-fabric -- exec --cwd /srv/app /bin/ls                  # start in another directory
+jev-fabric -- capabilities                                 # protocol, store format, features
 ```
 
 The first `--` separates Bend runtime options from yours. Shell syntax only
@@ -84,9 +101,31 @@ deadline; receipts keep 32 KiB tails, spools keep the first 1 MiB per stream,
 jobs keep their latest 64 events, and any loss is disclosed, never silent.
 
 **Timers are optional ceilings, not delays.** Work defaults to one hour, Jev to
-30 s, `wait` to 30 s and `watch` to 5 s. Override per call with
+30 s, `wait` and `follow` to 30 s and `watch` to 5 s. Override per call with
 `--timeout-ms N` before the command, or once with `JEV_FABRIC_TIMEOUT_MS`,
 `JEV_FABRIC_JEV_TIMEOUT_MS`, `JEV_FABRIC_WAIT_MS` and `JEV_FABRIC_WATCH_MS`.
+A `start` job alone may be given up to 24 hours (`--timeout-ms 86400000`), for
+dev servers and other long-lived work; its default stays the work default.
+
+**Interactive jobs.** `start --input pipe` keeps a job's stdin open: `write` and
+`close-input` feed it from any process, through a bounded private queue its
+worker drains every 25 ms, and `read` returns its output by byte offset.
+
+```sh
+id=$(jev-fabric -- start --input pipe -- python3 -u -i | jq -r .id)
+printf 'print(6 * 7)\n' | jev-fabric -- write "$id" --stdin
+jev-fabric -- read --wait-ms 5000 "$id" stdout      # {"text":"42\n","next":3,...}
+```
+
+**Jobs are durable, not tied to one harness.** Any process that shares a storage
+root (`JEV_FABRIC_HOME`, or `.jev-fabric-native/` in the working directory) can
+`list` its jobs, `follow` one as it runs, or pick it up again after a restart.
+`follow` prints each retained event as the worker publishes it, discloses
+evicted events with a `follow.loss` record, and ends with one `follow.end`
+carrying the final receipt. A default root is created with a `.gitignore`.
+Every root records its format (`.jev-fabric-store.json`), so different
+jev-fabric versions share it safely: a root written by a newer format is
+refused, never rewritten.
 
 ## Typed decisions, on purpose
 
@@ -123,10 +162,30 @@ jev-fabric -- jev examples/native/request.json 10000         # one billed call
 ## Sessions from Python or TypeScript
 
 `jev-fabric -- serve` keeps one process open and speaks JSONL on stdin/stdout:
-one request per line, one response per line. The session holds one Jev client, so
-its call and token budget covers the whole session, its credential resolves once,
-and its TLS connection stays warm. Each process or job request runs the CLI as a
-child, so a failing command costs one error response, never the session.
+one request per line, one response per line, matched by `id`. Requests run
+concurrently, so a long poll never holds up the next request. The session holds
+one Jev client, so its call and token budget covers the whole session, its
+credential resolves once, and its TLS connection stays warm. Each job request
+runs the CLI as a child, so a failing command costs one error response, never
+the session.
+
+It also owns **session children**: interactive processes that live as long as
+the connection, with stdin you `write` to and output you `read` by byte offset.
+A write-then-read round trip through a `cat` child takes about 3 ms.
+
+```text
+→ {"id":1,"op":"spawn","argv":["python3","-u","-i"]}
+← {"id":1,"ok":true,"result":{"id":"s-9c…","lifetime":"session","state":"running",…}}
+→ {"id":2,"op":"read","job":"s-9c…","stream":"stdout","waitMs":5000}
+→ {"id":3,"op":"write","job":"s-9c…","text":"print(6 * 7)\n"}
+← {"id":3,"ok":true,"result":{"id":"s-9c…","written":13,"closed":false}}
+← {"id":2,"ok":true,"result":{"id":"s-9c…","stream":"stdout","offset":0,"bytes":3,"omittedBytes":0,"text":"42\n","next":3,"eof":false,"state":"running"}}
+```
+
+Each stream keeps a rolling window of the latest 1 MiB; offsets never reset and
+a read below the window discloses the gap as `omittedBytes`. Closing the
+connection stops its children. The shared vocabulary for lifetimes, verbs and
+records is in [Shell composition](docs/composition.md).
 
 ```python
 from jev_fabric import Fabric                     # clients/python, stdlib only
@@ -135,6 +194,10 @@ with Fabric(max_evaluations=20) as fabric:        # explicit session budget
     job = fabric.start(["/bin/sh", "-c", "npm run dev"])
     fabric.watch(job, "ready", timeout_ms=30000)
     answer = fabric.jev(request)                  # typed, validated, warm connection
+
+    repl = fabric.spawn(["python3", "-u", "-i"])["id"]   # ends with the session
+    fabric.write(repl, "print(6 * 7)\n")
+    print(fabric.read(repl, "stdout", wait_ms=5000)["text"])
 ```
 
 ```ts
@@ -187,8 +250,8 @@ See the [native API](docs/native-api.md) and the skill's
 - **`exited` is not success.** A zero exit is an observation; verify the work.
 - **Bounded observations, not a lossless protocol.** No reboot resume,
   exactly-once execution or rollback.
-- **Checked policy core.** Project Bend code has no unsafe definitions; thirteen
-  pure policy modules and three proof roots check without trust warnings, and 27
+- **Checked policy core.** Project Bend code has no unsafe definitions; sixteen
+  pure policy modules and three proof roots check without trust warnings, and 49
   laws cover selected runtime policy. Effects cross an explicit, allowlisted
   foreign boundary of ten C functions. This is
   [scoped proof coverage](docs/safe-bend.md), not whole-program verification.
@@ -203,7 +266,8 @@ bun run typecheck                # the TypeScript client and example
 bun run demo                     # native, no model call
 ```
 
-More: [architecture](docs/architecture.md), [serve protocol](docs/serve-protocol.md),
+More: [architecture](docs/architecture.md), [shell composition](docs/composition.md),
+[serve protocol](docs/serve-protocol.md),
 [Bend migration](docs/bend-migration.md), [acceptance ledger](docs/native-rewrite-ledger.md).
 
 ## License

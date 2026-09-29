@@ -7,9 +7,10 @@
  * `~/.local/share/jev-fabric/current/clients/typescript`.
  *
  * The client starts one `serve` child, writes one request line per call and
- * resolves each promise with the matching response line. Budgets, deadlines,
- * credentials and Jev validation all live in the executable; this module only
- * frames JSON.
+ * resolves each promise with the response that carries the same id. Requests
+ * may overlap: serve answers them concurrently, in any order. Budgets,
+ * deadlines, credentials and Jev validation all live in the executable; this
+ * module only frames JSON.
  *
  * ```ts
  * import { Fabric } from './jev-fabric.ts';
@@ -17,14 +18,18 @@
  * const fabric = await Fabric.open({ maxEvaluations: 10 });
  * const job = await fabric.start(['/bin/sh', '-c', 'npm run dev']);
  * await fabric.watch(job, 'ready', { timeoutMs: 30000 });
- * const answer = await fabric.jev(request);
- * await fabric.close();
+ *
+ * const repl = await fabric.spawn(['python3', '-i']);   // a session child
+ * await fabric.write(repl.id, 'print(6 * 7)\n');
+ * const out = await fabric.read(repl.id, 'stdout', { waitMs: 5000 });
+ * await fabric.close();                                   // stops repl
  * ```
  */
 import { spawn, type ChildProcessWithoutNullStreams } from 'node:child_process';
 import { createInterface } from 'node:readline';
 
-export const PROTOCOL = 1;
+/** The protocol major this client speaks; features are only added within it. */
+export const PROTOCOL = 2;
 
 export interface FabricOptions {
   /** Defaults to `$JEV_FABRIC_BIN` or `jev-fabric` on PATH. */
@@ -45,6 +50,21 @@ export interface Ready {
   timeoutMs: number;
   maxEvaluations: number;
   maxTokens: number;
+  /** The storage format this binary reads and writes. */
+  store: number;
+  /** For example `darwin-arm64` or `linux-x64`. */
+  platform: string;
+  /** Implemented features, such as `sessions` or `serve-concurrent`. */
+  features: string[];
+}
+
+/** What `jev-fabric -- capabilities` prints. */
+export interface Capabilities {
+  version: string;
+  protocol: number;
+  store: number;
+  platform: string;
+  features: string[];
 }
 
 export interface Receipt {
@@ -58,15 +78,79 @@ export interface Receipt {
   truncated: { stdout: boolean; stderr: boolean };
 }
 
-export type JobState =
-  | (Receipt & { id: string; spoolLimitBytes: number })
-  | { schemaVersion: number; id: string; state: 'running'; spoolLimitBytes: number }
-  | { schemaVersion: number; id: string; state: 'failed'; exitCode: null; error: string; spoolLimitBytes: number };
+/** `durable` for `start` jobs, `session` for children of this connection (`s-` ids). */
+export type Lifetime = 'durable' | 'session';
 
+/** `label` is present only when the job was started with one. */
+export type JobState =
+  | (Receipt & { id: string; label?: string; lifetime: Lifetime; spoolLimitBytes: number })
+  | { schemaVersion: number; id: string; label?: string; lifetime: Lifetime; state: 'running'; spoolLimitBytes: number }
+  | {
+      schemaVersion: number;
+      id: string;
+      label?: string;
+      lifetime: Lifetime;
+      state: 'failed';
+      exitCode: null;
+      error: string;
+      spoolLimitBytes: number;
+    };
+
+/**
+ * Raw bytes of one stream from a byte offset. Offsets count every byte the
+ * child wrote and never reset; `omittedBytes` discloses bytes that fell out of
+ * the retained window before this read. `text` holds decoded UTF-8 (a partial
+ * character at the end waits for the next read); with `encoding: 'base64'`,
+ * `data` holds the exact bytes instead.
+ */
+export interface ReadRecord {
+  id: string;
+  stream: 'stdout' | 'stderr';
+  offset: number;
+  bytes: number;
+  omittedBytes: number;
+  text?: string;
+  data?: string;
+  next: number;
+  eof: boolean;
+  state: string;
+}
+
+/** `written` counts UTF-8 bytes; `closed` is true once stdin has ended. */
+export interface WriteRecord {
+  id: string;
+  written: number;
+  closed: boolean;
+}
+
+/**
+ * One retained job event. Known types: `job.started`, `process.output`
+ * (`stream`, `offset`, `bytes`, `omittedBytes`, `text`), `process.spool_limit`
+ * and, last, `job.finished`.
+ */
 export interface JobEvent {
   sequence: number;
   type: string;
   data: unknown;
+}
+
+/** One job directory under the storage root, as `list` reports it. */
+export interface JobSummary {
+  id: string;
+  /** `running`, `starting` (worker not yet announced) or a receipt state. */
+  state: 'running' | 'starting' | Receipt['state'];
+  label?: string;
+  /** Present, as `session`, only in a `scope: 'session'` listing. */
+  lifetime?: 'session';
+  /** Wall-clock start, epoch milliseconds; absent for jobs from before 0.4. */
+  startedAt?: number;
+  exitCode?: number | null;
+}
+
+export interface JobList {
+  /** Newest first, at most 1024. */
+  jobs: JobSummary[];
+  truncated: boolean;
 }
 
 export interface MonitorRecord {
@@ -105,8 +189,10 @@ interface Pending {
 }
 
 /**
- * One `jev-fabric -- serve` session. Requests may be issued concurrently;
- * the session answers them one at a time, in the order they were sent.
+ * One `jev-fabric -- serve` session. Requests may be issued concurrently and
+ * are answered as they complete, matched by id. Writes, closes and stops of
+ * one session child apply in the order they were sent; `jev` requests run one
+ * at a time. Closing the session stops its session children.
  */
 export class Fabric {
   readonly ready: Ready;
@@ -164,24 +250,106 @@ export class Fabric {
 
   // -- processes -------------------------------------------------------------
 
-  /** Runs literal argv to completion. A nonzero exit is a receipt, not an error. */
-  exec(argv: string[], options: { stdin?: string; timeoutMs?: number } = {}): Promise<Receipt> {
-    return this.call('exec', { argv, stdin: options.stdin, timeoutMs: options.timeoutMs });
+  /**
+   * Runs literal argv to completion. A nonzero exit is a receipt, not an error.
+   * `cwd` is an absolute directory the command starts in.
+   */
+  exec(argv: string[], options: { stdin?: string; timeoutMs?: number; cwd?: string } = {}): Promise<Receipt> {
+    return this.call('exec', { argv, stdin: options.stdin, timeoutMs: options.timeoutMs, cwd: options.cwd });
   }
 
-  /** Starts a detached job that outlives this session; resolves to its id. */
-  async start(argv: string[], options: { timeoutMs?: number } = {}): Promise<string> {
-    const started = await this.call<{ id: string }>('start', { argv, timeoutMs: options.timeoutMs });
+  /**
+   * Starts a detached job that outlives this session; resolves to its id.
+   * `timeoutMs` is the job's own lifetime, up to 86400000 (24 hours).
+   * `label` is 1..120 printable characters on one line. With `input: 'pipe'`
+   * its stdin stays open for `write` (fed through a queue drained every 25 ms).
+   */
+  async start(
+    argv: string[],
+    options: { timeoutMs?: number; label?: string; cwd?: string; input?: 'pipe' | 'null' } = {},
+  ): Promise<string> {
+    const started = await this.call<{ id: string }>('start', {
+      argv,
+      timeoutMs: options.timeoutMs,
+      label: options.label,
+      cwd: options.cwd,
+      input: options.input,
+    });
     return started.id;
+  }
+
+  /**
+   * Starts a session child: an `s-` id that lives until it exits, its own
+   * `timeoutMs` (up to 24 hours) passes, it is stopped, or this session ends.
+   * With `stdin: 'pipe'` (the default) its stdin stays open for `write`.
+   */
+  spawn(
+    argv: string[],
+    options: { stdin?: 'pipe' | 'null'; timeoutMs?: number; label?: string; cwd?: string } = {},
+  ): Promise<JobState> {
+    return this.call('spawn', {
+      argv,
+      stdin: options.stdin,
+      timeoutMs: options.timeoutMs,
+      label: options.label,
+      cwd: options.cwd,
+    });
+  }
+
+  /** Appends up to 65536 characters to an interactive child's stdin, in order. */
+  write(job: string, text: string): Promise<WriteRecord> {
+    return this.call('write', { job, text });
+  }
+
+  /** Ends an interactive child's stdin. Idempotent. */
+  closeInput(job: string): Promise<WriteRecord> {
+    return this.call('closeInput', { job });
+  }
+
+  /**
+   * Up to `max` (default and limit 65536) bytes of one stream from `offset`.
+   * With `waitMs` (1..300000), a long poll: it answers as soon as bytes past
+   * `offset` exist, the stream ends, or `waitMs` passes.
+   */
+  read(
+    job: string,
+    stream: 'stdout' | 'stderr',
+    options: { offset?: number; max?: number; waitMs?: number; encoding?: 'text' | 'base64' } = {},
+  ): Promise<ReadRecord> {
+    return this.call('read', {
+      job,
+      stream,
+      offset: options.offset,
+      max: options.max,
+      waitMs: options.waitMs,
+      encoding: options.encoding,
+    });
   }
 
   status(job: string): Promise<JobState> {
     return this.call('status', { job });
   }
 
-  /** Retained events with a sequence above `after` (a bounded snapshot). */
-  events(job: string, options: { after?: number } = {}): Promise<JobEvent[]> {
-    return this.call('events', { job, after: options.after });
+  /**
+   * Retained events with a sequence above `after` (a bounded snapshot). With
+   * `waitMs` (1..300000), a long poll: it answers once such an event exists or
+   * the job is terminal, or with the (possibly empty) array once `waitMs` passes.
+   */
+  events(job: string, options: { after?: number; waitMs?: number } = {}): Promise<JobEvent[]> {
+    return this.call('events', { job, after: options.after, waitMs: options.waitMs });
+  }
+
+  /**
+   * Job directories under the session's storage root, newest first; with
+   * `scope: 'session'`, this session's children instead.
+   */
+  list(options: { scope?: 'store' | 'session' } = {}): Promise<JobList> {
+    return this.call('list', { scope: options.scope });
+  }
+
+  /** The version, protocol, store format, platform and features of the binary. */
+  capabilities(): Promise<Capabilities> {
+    return this.call('capabilities', {});
   }
 
   /** The final receipt, or the running state once `timeoutMs` passes. */
@@ -205,14 +373,29 @@ export class Fabric {
     return this.call('validate', { request });
   }
 
-  /** One explicit, billed evaluation against the session budget. */
-  jev(request: JevRequest, options: { timeoutMs?: number } = {}): Promise<JevAnswer> {
-    return this.call('jev', { request, timeoutMs: options.timeoutMs });
+  /**
+   * One explicit, billed evaluation against the session budget. `provider` and
+   * `credential` apply to this request only: the credential travels over the
+   * private pipe and is never cached, echoed or logged.
+   */
+  jev(
+    request: JevRequest,
+    options: { timeoutMs?: number; provider?: 'typesafe' | 'openrouter' | 'vercel'; credential?: string } = {},
+  ): Promise<JevAnswer> {
+    return this.call('jev', {
+      request,
+      timeoutMs: options.timeoutMs,
+      provider: options.provider,
+      credential: options.credential,
+    });
   }
 
   // -- session ---------------------------------------------------------------
 
-  /** Ends the session by closing its input; resolves to the exit code. */
+  /**
+   * Ends the session by closing its input; resolves to the exit code once
+   * every request in flight has answered and the session children are stopped.
+   */
   close(): Promise<number | null> {
     if (!this.child.stdin.destroyed) this.child.stdin.end();
     return this.exited;

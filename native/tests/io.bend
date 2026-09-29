@@ -28,17 +28,17 @@ def tests(+marker: String) -> IO(Unit):
     # the second can create this marker. No timing benchmark is needed.
     first : Chan(Process.Report) <- IO.fork(
       Process.Report,
-      Process.run(waits_for_marker(marker), "", 1500)
+      Process.run_input(waits_for_marker(marker), "", 1500)
     )
     second : Chan(Process.Report) <- IO.fork(
       Process.Report,
-      Process.run(creates_marker(marker), "", 1500)
+      Process.run_input(creates_marker(marker), "", 1500)
     )
     a : Process.Report <- IO.join(Process.Report, first)
     b : Process.Report <- IO.join(Process.Report, second)
     assert(ok(a, 0, "first"))
     assert(ok(b, 0, "second"))
-    echo : Process.Report <- Process.run(["/bin/cat"], "native stdin\n", 1000)
+    echo : Process.Report <- Process.run_input(["/bin/cat"], "native stdin\n", 1000)
     assert(ok(echo, 0, "native stdin\n"))
     IO.print("native IO assertions: 3")
 
@@ -51,5 +51,7 @@ def args(values: List<String>) -> IO(Unit):
 
 def main() -> IO(Unit):
   do IO<Unit>:
-    values : List<String> <- IO.args()
+    # IO.args() starts with the program as invoked (Bend 2.0.32+).
+    invoked : List<String> <- IO.args()
+    values : List<String> = List.drop(&1, String, invoked, 1n)
     args(values)

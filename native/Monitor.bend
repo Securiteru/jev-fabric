@@ -101,8 +101,11 @@ def watch_parsed(+id: String, +literal: String, parsed: Maybe<&2, Nat>) -> IO(Un
         started : Nat <- IO.now()
         loop(Policy.fuel(duration), id, literal, started, duration, Again{Policy.initial_model()})
 
+# A watch only reads the store, so it checks the format without adopting it.
 def watch(id: String, ms: String, +literal: String) -> IO(Unit):
-  watch_parsed(id, literal, Policy.validate(ms, literal))
+  do IO<Unit>:
+    Host.store(False{})
+    watch_parsed(id, literal, Policy.validate(ms, literal))
 
 def command(args: List<String>) -> IO(Unit):
   match args:

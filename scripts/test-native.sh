@@ -3,8 +3,7 @@ set -eu
 export BEND_NO_TELEMETRY=1
 cd "$(dirname "$0")/.."
 sh scripts/build-native.sh
-bend examples/native/judge.bend --check-only
-bend examples/native/persistent.bend --check-only
+# The safety gate in build-native.sh already checked every example module.
 
 # Build outside Bun's test hooks, with process-group deadlines and phase evidence.
 fixtures='core io fail-fast jobs jobs-streams codec codec-limits wire codec-wire-probe

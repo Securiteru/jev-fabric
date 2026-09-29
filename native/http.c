@@ -274,9 +274,9 @@ static void jh_post_call(IoWork *w) {
 }
 
 static Term jh_bytes(Env e, const char *data, size_t size) {
-  Term bytes = term_pak(CID_NIL, 0);
+  Term bytes = term_pak(CID(Nil), 0);
   for (size_t i = size; i > 0; i--) {
-    bytes = io_node(e, CID_CON, (uint8_t)data[i - 1], bytes);
+    bytes = io_node(e, CID(Con), (uint8_t)data[i - 1], bytes);
   }
   return bytes;
 }
@@ -305,7 +305,7 @@ static int jh_https(const char *url, u64 length) {
   return length > 8 && length <= JH_URL_MAX && strncmp(url, "https://", 8) == 0;
 }
 
-#ifdef CID_NATIVE_HTTP_POST
+#ifdef CID(Native.http_post)
 Term native_http_post_run(Env e, Term *f, IoWork *w) {
   JhPost *post = io_mem(calloc(1, sizeof *post));
   w->data = (char *)post;
@@ -325,6 +325,6 @@ Term native_http_post_run(Env e, Term *f, IoWork *w) {
 }
 
 static void __attribute__((constructor)) native_http_post_use(void) {
-  io_eff(CID_NATIVE_HTTP_POST, native_http_post_run, 0);
+  io_eff(CID(Native.http_post), native_http_post_run, 0);
 }
 #endif

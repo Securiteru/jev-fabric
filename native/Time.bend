@@ -21,6 +21,10 @@ def setting(name: String, fallback: U32, max: U32) -> IO(U32):
 def max_timeout() -> U32:
   3600000
 
+# The lifetime ceiling of a detached `start` job only.
+def job_max_timeout() -> U32:
+  Policy.job_max()
+
 def work() -> IO(U32):
   setting("JEV_FABRIC_TIMEOUT_MS", Policy.work_default(), max_timeout())
 
