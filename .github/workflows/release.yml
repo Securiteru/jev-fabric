@@ -142,7 +142,9 @@ jobs:
       contents: read
       id-token: write
     env:
-      NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+      # setup-node puts a placeholder in NODE_AUTH_TOKEN when none is given, so
+      # gate on the secret itself.
+      NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -163,12 +165,15 @@ jobs:
           path: npm-out/*.tgz
           if-no-files-found: error
       - name: Publish to npm
-        if: ${{ env.NODE_AUTH_TOKEN != '' }}
+        if: ${{ env.NPM_TOKEN != '' }}
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
         run: |
           set -eu
           # Platform packages first, so `jev-fabric` never points at a missing version.
           for pass in platform main; do
-            for tarball in npm-out/*.tgz; do
+            # ./ keeps npm from reading npm-out/x.tgz as a GitHub user/repo shorthand.
+            for tarball in ./npm-out/*.tgz; do
               spec=$(tar -xzOf "$tarball" package/package.json | node -p 'const p=JSON.parse(require("fs").readFileSync(0,"utf8")); p.name+"@"+p.version')
               case "$pass:${spec%@*}" in platform:jev-fabric|main:jev-fabric-*) continue ;; esac
               if [ -n "$(npm view "$spec" version 2>/dev/null)" ]; then echo "$spec already published"; continue; fi
