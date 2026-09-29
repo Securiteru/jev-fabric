@@ -35,8 +35,22 @@ extern char **environ;
 #define JF_CWD_MAX 4096
 
 #ifdef __linux__
-// glibc 2.29+; declared here in case the build's feature macros hide it.
-extern int posix_spawn_file_actions_addchdir_np(posix_spawn_file_actions_t *, const char *);
+#include <dlfcn.h>
+#include <pthread.h>
+#include <stdlib.h>
+// posix_spawn_file_actions_addchdir_np exists from glibc 2.29. Release builds
+// target glibc 2.28, so resolve it at run time; without it a child with its own
+// cwd starts through `/bin/sh -c 'cd -- "$0" && exec "$@"'`, where the directory
+// and every argument are positional parameters, never parsed as shell source.
+typedef int (*jf_addchdir_fn)(posix_spawn_file_actions_t *, const char *);
+static jf_addchdir_fn jf_addchdir;
+static pthread_once_t jf_addchdir_once = PTHREAD_ONCE_INIT;
+static void jf_addchdir_load(void) {
+  void *self = dlopen(NULL, RTLD_NOW);
+  if (self) {
+    jf_addchdir = (jf_addchdir_fn)dlsym(self, "posix_spawn_file_actions_addchdir_np");
+  }
+}
 #endif
 
 // Report flags; Process.decode reads the same bits.
@@ -260,6 +274,8 @@ static void jf_exec_call(IoWork *w) {
   posix_spawnattr_t attr;
   int have_actions = 0;
   int have_attr = 0;
+  char **spawn_argv = job->argv;
+  char **trampoline = NULL;
   pthread_mutex_lock(&jf_gate);
   if (!jf_shutdown && jf_jobs < JF_JOBS) {
     for (unsigned i = 0; i < JF_JOBS; i++) {
@@ -333,10 +349,35 @@ static void jf_exec_call(IoWork *w) {
     goto cleanup;
   }
   if (job->cwd && job->cwd[0]) {
+#ifdef __linux__
+    pthread_once(&jf_addchdir_once, jf_addchdir_load);
+    if (jf_addchdir) {
+      w->code = jf_addchdir(&actions, job->cwd);
+    } else {
+      size_t count = 0;
+      while (job->argv[count]) {
+        count++;
+      }
+      trampoline = calloc(count + 5, sizeof(char *));
+      if (!trampoline) {
+        w->code = ENOMEM;
+        goto cleanup;
+      }
+      trampoline[0] = "/bin/sh";
+      trampoline[1] = "-c";
+      trampoline[2] = "cd -- \"$0\" && exec \"$@\"";
+      trampoline[3] = job->cwd;
+      for (size_t i = 0; i < count; i++) {
+        trampoline[4 + i] = job->argv[i];
+      }
+      spawn_argv = trampoline;
+    }
+#else
 #pragma clang diagnostic push
 #pragma clang diagnostic ignored "-Wdeprecated-declarations"
     w->code = posix_spawn_file_actions_addchdir_np(&actions, job->cwd);
 #pragma clang diagnostic pop
+#endif
     if (w->code) {
       goto cleanup;
     }
@@ -355,7 +396,7 @@ static void jf_exec_call(IoWork *w) {
   if (jf_shutdown) {
     w->code = ECANCELED;
   } else {
-    w->code = posix_spawnp(&pid, job->argv[0], &actions, &attr, job->argv, environ);
+    w->code = posix_spawnp(&pid, spawn_argv[0], &actions, &attr, spawn_argv, environ);
   }
   if (!w->code && release_stdin) {
     int none = open("/dev/null", O_RDONLY | O_CLOEXEC);
@@ -478,6 +519,7 @@ cleanup:
   if (have_attr) {
     posix_spawnattr_destroy(&attr);
   }
+  free(trampoline);
   pthread_mutex_lock(&jf_gate);
   jf_pids[slot] = 0;
   jf_jobs--;
