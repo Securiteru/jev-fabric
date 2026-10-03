@@ -11,7 +11,7 @@ if (!binary) {
   process.stderr.write(
     `jev-fabric: no prebuilt executable for ${process.platform}-${process.arch}` +
       (name ? ` (optional dependency ${name} is not installed)` : " (macOS and Linux only)") +
-      ". See https://github.com/monotykamary/jev-fabric#install-it-yourself\n",
+      ". See https://github.com/fabric-runtime/jev-fabric#install-it-yourself\n",
   );
   process.exit(1);
 }

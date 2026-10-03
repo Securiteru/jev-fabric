@@ -3,8 +3,8 @@ Native process orchestration with typed, explicit Jev decisions.
 ## Install
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/monotykamary/jev-fabric/main/install.sh | sh
-npx skills add monotykamary/jev-fabric
+curl -fsSL https://raw.githubusercontent.com/fabric-runtime/jev-fabric/main/install.sh | sh
+npx skills add fabric-runtime/jev-fabric
 ```
 
 | Archive | Platform |

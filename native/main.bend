@@ -107,7 +107,7 @@ def usage_text() -> String:
 # exact command, runs it, and exits with its status. JEV_FABRIC_PREFIX and
 # JEV_FABRIC_VERSION pass through to the installer.
 def update_command() -> String:
-  "curl -fsSL https://raw.githubusercontent.com/monotykamary/jev-fabric/main/install.sh | sh"
+  "curl -fsSL https://raw.githubusercontent.com/fabric-runtime/jev-fabric/main/install.sh | sh"
 
 # Ten minutes covers a slow download; the installer itself takes seconds.
 def update_timeout() -> U32:

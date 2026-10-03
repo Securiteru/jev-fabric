@@ -35,7 +35,7 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/monotykamary/jev-fabric.git"
+    "url": "git+https://github.com/fabric-runtime/jev-fabric.git"
   },
-  "homepage": "https://github.com/monotykamary/jev-fabric"
+  "homepage": "https://github.com/fabric-runtime/jev-fabric"
 }

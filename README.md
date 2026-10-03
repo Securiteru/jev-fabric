@@ -1,4 +1,4 @@
-<img src="https://raw.githubusercontent.com/monotykamary/jev-fabric/main/static/banner-ink.svg" alt="jev-fabric" width="100%" />
+<img src="https://raw.githubusercontent.com/fabric-runtime/jev-fabric/main/static/banner-ink.svg" alt="jev-fabric" width="100%" />
 
 # jev-fabric 🧵
 
@@ -24,14 +24,14 @@ runtime. Independent of Pi, Codex, Claude or any other harness.
 
 **Your agent now has hands that don't get lost in the logs.**
 
-<img src="https://raw.githubusercontent.com/monotykamary/jev-fabric/main/static/demo.svg" alt="jev-fabric racing Wikipedia and playing Doom with typed Jev choices" width="100%" />
+<img src="https://raw.githubusercontent.com/fabric-runtime/jev-fabric/main/static/demo.svg" alt="jev-fabric racing Wikipedia and playing Doom with typed Jev choices" width="100%" />
 
 ## Give it to your agent
 
 Paste this into Codex, Claude Code or any coding agent:
 
 ```text
-Install jev-fabric with `curl -fsSL https://raw.githubusercontent.com/monotykamary/jev-fabric/main/install.sh | sh`, add its skill with `npx skills add monotykamary/jev-fabric`, then verify with `jev-fabric -- exec /bin/echo ready`. Don't make any Jev (network model) calls until I give you credentials and ask.
+Install jev-fabric with `curl -fsSL https://raw.githubusercontent.com/fabric-runtime/jev-fabric/main/install.sh | sh`, add its skill with `npx skills add fabric-runtime/jev-fabric`, then verify with `jev-fabric -- exec /bin/echo ready`. Don't make any Jev (network model) calls until I give you credentials and ask.
 ```
 
 That's it. The agent installs a checksum-verified release, learns the workflow
@@ -40,8 +40,8 @@ from the skill, and proves the binary runs.
 ## Install it yourself
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/monotykamary/jev-fabric/main/install.sh | sh
-npx skills add monotykamary/jev-fabric        # or: bunx skills add monotykamary/jev-fabric
+curl -fsSL https://raw.githubusercontent.com/fabric-runtime/jev-fabric/main/install.sh | sh
+npx skills add fabric-runtime/jev-fabric        # or: bunx skills add fabric-runtime/jev-fabric
 ```
 
 Releases ship a macOS universal binary and Linux x64/arm64 binaries. The installer

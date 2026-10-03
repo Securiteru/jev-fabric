@@ -20,8 +20,8 @@ if (!archives || !out) {
   process.exit(2);
 }
 
-const repository = { type: "git", url: "git+https://github.com/monotykamary/jev-fabric.git" };
-const common = { license: "MIT", repository, homepage: "https://github.com/monotykamary/jev-fabric" };
+const repository = { type: "git", url: "git+https://github.com/fabric-runtime/jev-fabric.git" };
+const common = { license: "MIT", repository, homepage: "https://github.com/fabric-runtime/jev-fabric" };
 // Archive platform -> npm package and its install constraints.
 const platforms = [
   { archive: "darwin-universal", name: "jev-fabric-darwin", os: ["darwin"], cpu: ["arm64", "x64"] },
@@ -52,7 +52,7 @@ try {
     cpSync(join(release, "bin", "jev-fabric"), join(pkg, "bin", "jev-fabric"));
     chmodSync(join(pkg, "bin", "jev-fabric"), 0o755);
     cpSync(join(root, "LICENSE"), join(pkg, "LICENSE"));
-    writeFileSync(join(pkg, "README.md"), `# ${platform.name}\n\nThe ${platform.archive} executable for [jev-fabric](https://github.com/monotykamary/jev-fabric). Install \`jev-fabric\` instead; npm selects this package automatically.\n`);
+    writeFileSync(join(pkg, "README.md"), `# ${platform.name}\n\nThe ${platform.archive} executable for [jev-fabric](https://github.com/fabric-runtime/jev-fabric). Install \`jev-fabric\` instead; npm selects this package automatically.\n`);
     json(join(pkg, "package.json"), {
       name: platform.name,
       version,

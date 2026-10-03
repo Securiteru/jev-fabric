@@ -1,7 +1,7 @@
 #!/bin/sh
 # Install jev-fabric from GitHub releases.
 #
-#   curl -fsSL https://raw.githubusercontent.com/monotykamary/jev-fabric/main/install.sh | sh
+#   curl -fsSL https://raw.githubusercontent.com/fabric-runtime/jev-fabric/main/install.sh | sh
 #
 # Environment:
 #   JEV_FABRIC_VERSION  release tag to install, e.g. v0.1.0 (default: latest)
@@ -15,7 +15,7 @@
 #   $PREFIX/share/jev-fabric/current            -> <version>
 set -eu
 
-repo='monotykamary/jev-fabric'
+repo='fabric-runtime/jev-fabric'
 prefix="${JEV_FABRIC_PREFIX:-$HOME/.local}"
 version="${JEV_FABRIC_VERSION:-latest}"
 
@@ -91,4 +91,4 @@ say ''
 say 'Next:'
 say '  jev-fabric -- --help'
 say '  jev-fabric -- update                     # later: reinstall the latest release'
-say '  npx skills add monotykamary/jev-fabric   # teach your coding agent'
+say '  npx skills add fabric-runtime/jev-fabric   # teach your coding agent'

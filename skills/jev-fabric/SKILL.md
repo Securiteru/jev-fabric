@@ -23,7 +23,7 @@ jev-fabric -- capabilities     # {"version":…,"protocol":2,"store":1,"platform
 If it is missing, install the release binary (macOS universal, Linux x64/arm64):
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/monotykamary/jev-fabric/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/fabric-runtime/jev-fabric/main/install.sh | sh
 ```
 
 It installs to `~/.local/bin/jev-fabric` and the Bend library to

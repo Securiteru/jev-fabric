@@ -137,7 +137,7 @@ test('update shows and runs the curl installer, relaying its output and status',
   ].join('\n');
   writeFileSync(join(bin, 'curl'), fakeCurl, { mode: 0o755 });
   const path = `${bin}:/usr/bin:/bin`;
-  const command = 'curl -fsSL https://raw.githubusercontent.com/monotykamary/jev-fabric/main/install.sh | sh';
+  const command = 'curl -fsSL https://raw.githubusercontent.com/fabric-runtime/jev-fabric/main/install.sh | sh';
 
   const ok = await capture([nativeBin, '--', 'update'], {
     env: { PATH: path, FAKE_RELEASE: 'v9.9.9', FAKE_EXIT: '0' },
@@ -146,7 +146,7 @@ test('update shows and runs the curl installer, relaying its output and status',
   expect(ok.out).toBe('installed v9.9.9\n');
   expect(ok.err).toBe(`${command}\ninstaller note\n`);
   expect(readFileSync(record, 'utf8')).toBe(
-    '-fsSL\nhttps://raw.githubusercontent.com/monotykamary/jev-fabric/main/install.sh\n',
+    '-fsSL\nhttps://raw.githubusercontent.com/fabric-runtime/jev-fabric/main/install.sh\n',
   );
 
   const failed = await capture([nativeBin, '--', 'update'], {
