@@ -116,3 +116,76 @@ describe('native Bend/POSIX boundary', () => {
     expect(JSON.parse(r.stdout).stdout).toBe('native\n');
   });
 });
+
+describe('opt-in output censoring (JEV_FABRIC_CENSOR)', () => {
+  const censor = (value: string) => ({ ...process.env, JEV_FABRIC_CENSOR: value });
+  async function cexec(args: string[], value = '1') {
+    const r = await command(['exec', '2000', ...args], '', censor(value));
+    expect(r.code).toBe(0);
+    return JSON.parse(r.stdout);
+  }
+
+  test('is off by default and passes output through verbatim', async () => {
+    const key = 'sk-proj-abcdefghijklmnopqrstuvwxyz1234';
+    const r = await exec(['/bin/echo', `key ${key}`]);
+    expect(r.report.stdout).toBe(`key ${key}\n`);
+    const off = await cexec(['/bin/echo', `key ${key}`], '0');
+    expect(off.stdout).toBe(`key ${key}\n`);
+  });
+
+  test('masks named credential formats in stdout and stderr, keeping ends visible', async () => {
+    const r = await cexec([
+      '/bin/sh', '-c',
+      'echo "openai sk-proj-abcdefghijklmnopqrstuvwxyz1234"; echo "aws AKIAIOSFODNN7EXAMPLE" >&2',
+    ]);
+    expect(r.stdout).toBe('openai sk-pro…34\n');
+    expect(r.stderr).toBe('aws AKIAIO…LE\n');
+    expect(r.stdout + r.stderr).not.toContain('cdefghijklmnopqrstuvwxyz12');
+    expect(r.stderr).not.toContain('SFODNN7EXAMP');
+  });
+
+  test('generic vendor-prefixed keys mask after the prefix', async () => {
+    const r = await cexec(['/bin/echo', 'ghp_abcdefghijklmnopqrstuvwxyz0123456789']);
+    expect(r.stdout).toBe('ghp_ab…89\n');
+  });
+
+  test('strict mode additionally masks 40+ byte opaque runs', async () => {
+    const opaque = 'abcdefghijklmnopqrstuvwxyz0123456789ABCDEFGH';
+    const strict = await cexec(['/bin/echo', `token ${opaque}`], 'strict');
+    expect(strict.stdout).toBe('token abcd…GH\n');
+    const named = await cexec(['/bin/echo', `token ${opaque}`]);
+    expect(named.stdout).toBe(`token ${opaque}\n`);
+  });
+
+  test('a credential split across read boundaries still masks', async () => {
+    const r = await cexec([
+      '/bin/sh', '-c',
+      'printf "%08180d" 0; printf "sk-proj-SPLITSECRETabcdefghijklmnopqrstuv"; echo " END"',
+    ]);
+    expect(r.stdout).toContain('sk-pro…uv END\n');
+    expect(r.stdout).not.toContain('SPLITSECRET');
+  });
+
+  test('auth headers and connection strings keep their framing visible', async () => {
+    const r = await cexec([
+      '/bin/sh', '-c',
+      'echo "Authorization: Bearer abcdefghijklmnop"; echo "postgres://user:supersecretpw@host/db"',
+    ]);
+    expect(r.stdout).toBe(
+      'Authorization: Bearer abcd…op\npostgres://user:s…w@host/db\n',
+    );
+  });
+
+  test('a PEM private key keeps its envelope and loses the body', async () => {
+    const r = await cexec([
+      '/bin/sh', '-c',
+      'printf -- "-----BEGIN PRIVATE KEY-----\\nMIIEvgIBADANBgkqhkiG9w0BAQEFAASC\\n-----END PRIVATE KEY-----\\n"',
+    ]);
+    expect(r.stdout).toBe('-----BEGIN PRIVATE KEY-----\n***\n-----END PRIVATE KEY-----\n');
+  });
+
+  test('short lookalikes and prose are left alone', async () => {
+    const r = await cexec(['/bin/sh', '-c', 'echo "sk-short ask- about keys pk-x token=abc"']);
+    expect(r.stdout).toBe('sk-short ask- about keys pk-x token=abc\n');
+  });
+});

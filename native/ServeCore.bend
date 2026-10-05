@@ -34,6 +34,7 @@ def features() -> List<&2, String>:
     "durable-input",
     "read",
     "jev-request-credential",
+    "censor",
   ]
 
 def strings_json(items: List<&2, String>, first: Bool) -> String:

@@ -170,6 +170,27 @@ describe('durable native command jobs', () => {
     expect(await events(id, xs.at(-2).sequence)).toEqual([xs.at(-1)]);
   }, 30000);
 
+  test('JEV_FABRIC_CENSOR masks credentials before they persist to the spool', async () => {
+    const key = 'sk-ant-abcdefghijklmnopqrstuvwxyz1234';
+    const id = await start(
+      ['/bin/sh', '-c', `echo "key ${key} here"; echo "err ghp_abcdefghijklmnopqrstuvwxyz0123456789" >&2`],
+      5000,
+      { JEV_FABRIC_CENSOR: '1' },
+    );
+    const receipt = await wait(id);
+    expect(receipt.state).toBe('exited');
+    expect(receipt.stdout).toBe('key sk-ant…34 here\n');
+    expect(receipt.stderr).toBe('err ghp_ab…89\n');
+    const dir = join(root, id);
+    const out = readFileSync(join(dir, 'stdout.bin'), 'utf8');
+    const err = readFileSync(join(dir, 'stderr.bin'), 'utf8');
+    expect(out).toBe('key sk-ant…34 here\n');
+    expect(err).toBe('err ghp_ab…89\n');
+    expect(out).not.toContain('cdefghijklmnopqrstuvwxyz1234');
+    expect(err).not.toContain('cdefghijklmnopqrstuvwxyz01234567');
+    expect(streamText(await events(id))).toContain('sk-ant…34');
+  });
+
   test('replay retention evicts oldest entries and preserves strictly increasing cursor', async () => {
     const script = 'n=0; while [ "$n" -lt 90 ]; do printf x; /bin/sleep 0.05; n=$((n+1)); done';
     const id = await start(['/bin/sh', '-c', script], 20000);

@@ -127,6 +127,15 @@ Every root records its format (`.jev-fabric-store.json`), so different
 jev-fabric versions share it safely: a root written by a newer format is
 refused, never rewritten.
 
+**Opt-in output censoring.** `JEV_FABRIC_CENSOR=1` masks well-known credential
+formats — provider keys, tokens, auth headers, connection-string passwords,
+JWTs and PEM bodies — before child output reaches the spool or the receipt
+tail, so a leaked key never persists to disk. Masks keep a secret's start and
+end visible (`sk-proj-a1…z9`), so a reader can still tell which credential
+leaked. `JEV_FABRIC_CENSOR=strict` additionally masks any unlabelled word run
+of 40+ characters. Unset or `0` leaves output untouched. Censoring is a safety
+net, not a license to print secrets.
+
 ## Typed decisions, on purpose
 
 Jev is a *System One* model: it answers structured questions with typed values
